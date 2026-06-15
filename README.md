@@ -12,7 +12,7 @@ handed), and the information appears in the right place in the record.
 
 ## What it does
 
-MediSnap is a mock electronic health record (EHR) with a **phone-camera scanner**
+depaperfy is a mock electronic health record (EHR) with a **phone-camera scanner**
 bolted on. You open a patient screen on the computer, tap the camera icon, and a
 QR code appears. Scan it with your phone, take a photo, and the data shows up back
 on the computer — no typing.
@@ -25,20 +25,20 @@ It handles two kinds of paper:
 
 ### Highlights
 
-- 📷 **Scan with your phone** — a QR code hands the camera off to your phone; the
+- **Scan with your phone** — a QR code hands the camera off to your phone; the
   photo never has to be saved or emailed anywhere.
-- 🔄 **Rotate before sending** — upside-down or sideways photos happen. Spin the
+- **Rotate before sending** — upside-down or sideways photos happen. Spin the
   image on the phone before it's uploaded.
-- 🗂️ **Single or batch** — scan one page, or photograph a whole stack at once. In a
+- **Single or batch** — scan one page, or photograph a whole stack at once. In a
   batch you **label each page** as a note or a lab report on the phone, and each
   one is filed in the correct tab automatically.
-- 👤 **Finds the right patient** — the name / ID read off a note is matched against
+- **Finds the right patient** — the name / ID read off a note is matched against
   the patient list, and the note header fills in from the official record rather
   than from whatever the camera happened to read.
-- 🧪 **Lab results as a table** — a printed report becomes a structured grid whose
+- **Lab results as a table** — a printed report becomes a structured grid whose
   columns match the report itself. You can edit any cell, or add rows and columns
   by hand.
-- 🌐 **Works online or fully offline** — two interchangeable text-reading engines
+- **Works online or fully offline** — two interchangeable text-reading engines
   (see below): one runs on the device with nothing leaving the machine, the other
   uses a cloud API. You choose.
 
@@ -103,8 +103,7 @@ Scan sessions live in memory with a 30-minute expiry — fine for a demo.
 
 ### The reading pipeline
 
-The pipeline is deliberately simple — a fixed, two-step transformation, **not** an
-agent:
+The pipeline is deliberately simple — a fixed, two-step transformation:
 
 ```
 photo ──▶ [vision model: read the image]  ──▶  [structure it]  ──▶  note fields
