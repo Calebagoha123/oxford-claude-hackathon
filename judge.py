@@ -17,8 +17,8 @@ Two backends, picked with JUDGE_PROVIDER (mirrors ocr.OCR_PROVIDER):
 
 Public functions:
   transcribe_reference(image_bytes) -> str          # strong-model reference transcript
+  transcribe_batch(image_list)      -> list[str]    # several at once (local path)
   judge_note(reference, fields)     -> {key: {verdict, reason}}
-  free()                                             # drop the local model (free VRAM)
 
 Verdicts (one per field):
   correct       filled & faithful to the reference, OR correctly left empty
@@ -270,21 +270,3 @@ def judge_note(reference: str, fields: dict) -> dict:
         return _normalize(_parse_json(raw))
     except Exception:  # noqa: BLE001 - malformed/truncated JSON: mark uncertain
         return _salvage(raw)
-
-
-def free():
-    """Release the local judge model so the GPU is free for the next phase."""
-    global _pipe
-    if _pipe is None:
-        return
-    _pipe = None
-    try:
-        import gc
-
-        import torch
-
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-    except Exception:  # noqa: BLE001 - best effort
-        pass
