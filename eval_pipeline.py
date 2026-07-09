@@ -1,8 +1,10 @@
-"""Evaluation pipeline: grade MedGemma-4B field extraction with MedGemma-27B.
+"""Evaluation pipeline: grade the two-stage extractor (Qwen transcribe ->
+MedGemma field-routing) against a trusted reference transcript.
 
-Measures the two failure modes we keep hitting — the 4B over-populating fields
+Measures the two failure modes we keep hitting — MedGemma over-populating fields
 (hallucination) and mis-routing content into the wrong section — so the
-extraction prompt can be tuned against numbers instead of vibes.
+extraction prompt can be tuned against numbers instead of vibes. Stage 1 (Qwen
+vision OCR) replaced the old single-model read, which was the accuracy floor.
 
 Layout (all under ./eval):
   eval/images/<name>.jpg          drop note photos here
@@ -19,8 +21,10 @@ Usage (on the VM):
   uv run --no-sync python eval_pipeline.py bootstrap     # just (re)build refs
   uv run --no-sync python eval_pipeline.py score <run_id>  # recompute metrics
 
-Provider knobs (env, mirror the app): OCR_PROVIDER for the 4B, JUDGE_PROVIDER /
-JUDGE_MODEL / JUDGE_QUANT for the judge. --provider sets JUDGE_PROVIDER inline.
+Provider knobs (env, mirror the app): TRANSCRIBE_PROVIDER (default "qwen") +
+QWEN_QUANT for stage 1, EXTRACT_PROVIDER (default "medgemma") for stage 2, and
+JUDGE_PROVIDER / JUDGE_MODEL / JUDGE_QUANT for the judge. OCR_PROVIDER still
+forces both extractor stages onto one backend. --provider sets JUDGE_PROVIDER.
 """
 
 import argparse
@@ -242,7 +246,9 @@ def bootstrap(gpus: list[str], batch_size: int) -> int:
 
 
 def extract(run_id: str, gpus: list[str], batch_size: int) -> int:
-    """Run the 4B extractor over every image -> predictions.json."""
+    """Run the two-stage extractor (Qwen transcribe -> MedGemma fields) over every
+    image -> predictions.json. Each worker loads both models, so this wants a card
+    with room for the 4-bit 27B plus the 4B (a 24GB L4 is tight but fits)."""
     images = [img.name for img in _images()]
     if not images:
         print(f"No images in {IMAGES_DIR}.", file=sys.stderr)
@@ -429,13 +435,11 @@ def main() -> int:
         return bootstrap(judge_gpus, bs)
 
     if args.cmd == "run":
+        # No LLM judge: `run` just extracts. Correctness is assessed by a human
+        # clinician in the /eval review UI (reviews.json), not a 27B judge.
         run_id = _new_run_id()
-        print(f"=== run {run_id} (extract_gpus={extract_gpus or 'default'}, "
-              f"judge_gpus={judge_gpus or 'default'}, batch={bs}) ===")
-        rc = (bootstrap(judge_gpus, bs)
-              or extract(run_id, extract_gpus, bs)
-              or judge_run(run_id, judge_gpus, bs))
-        return rc or score(run_id)
+        print(f"=== run {run_id} (extract_gpus={extract_gpus or 'default'}, batch={bs}) ===")
+        return extract(run_id, extract_gpus, bs)
 
     # phase commands take an optional run_id
     run_id = getattr(args, "run_id", None)

@@ -10,10 +10,16 @@ dependencies = [
     "python-multipart>=0.0.9",
     "jinja2>=3.1",
     "qrcode>=7.4",
-    "transformers>=4.53",
+    # Qwen3.6-27B (model_type "qwen3_5") is recent — it needs a new transformers.
+    # Upgrade (`uv pip install -U transformers`, or git main) if the model fails to load.
+    "transformers>=4.57",
     "torch>=2.4",
     "accelerate>=1.0",
+    # 4-bit quantization for the 27B on a 24GB L4 (QWEN_QUANT / JUDGE_QUANT). CUDA
+    # only, so scope to Linux to keep macOS installs working.
+    "bitsandbytes>=0.43; sys_platform == 'linux'",
     "pillow>=10.4",
+    "pytesseract>=0.3.10",
     "huggingface-hub>=0.26",
     "anthropic>=0.40",
 ]

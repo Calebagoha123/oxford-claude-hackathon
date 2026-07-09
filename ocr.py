@@ -1,15 +1,28 @@
-"""OCR + structured extraction — swappable provider.
+"""OCR + structured extraction — a two-stage, independently-swappable pipeline.
 
-Two backends, picked with OCR_PROVIDER:
-  - "medgemma" (default): local MedGemma 1.5 4B via transformers. Zero config,
-    nothing leaves the machine — the offline / data-sovereignty story for LMICs.
-  - "claude": Claude vision via the Anthropic API. Better on messy handwriting
-    and reliable JSON output; needs ANTHROPIC_API_KEY.
+MedGemma-4B is a strong clinical *reasoner* but a weak *reader*: doing OCR and
+field-routing in one shot, its transcription dragged the whole output down. So we
+split the job and use the right model for each half:
+
+  stage 1  image  -> transcript   TRANSCRIBE_PROVIDER (default "qwen")
+  stage 2  transcript -> fields   EXTRACT_PROVIDER    (default "medgemma")
+
+Transcription backends (TRANSCRIBE_PROVIDER):
+  - "qwen" (default): local Qwen3.6-27B vision model. Far better handwriting OCR.
+    27B won't fit a 24GB L4 in bf16, so it loads 4-bit by default (QWEN_QUANT=1).
+  - "medgemma": the old single-model behaviour (MedGemma-4B reads the image too).
+  - "claude": Claude vision via the Anthropic API; needs ANTHROPIC_API_KEY.
+
+Extraction backends (EXTRACT_PROVIDER) — text-only, they never see the image:
+  - "medgemma" (default): local MedGemma-4B routing the clean transcript into
+    note fields. This is what MedGemma is good at.
+  - "claude": Claude via the Anthropic API; needs ANTHROPIC_API_KEY.
 
 Public functions:
-  transcribe(image_bytes) -> str             # plain transcription
-  extract(image_bytes)    -> {text, fields}  # transcription + filled note fields
-  warmup()                                   # preload the local model (no-op for claude)
+  transcribe(image_bytes)          -> str             # stage 1 only
+  extract_fields_from_text(text)   -> {note_key: value}  # stage 2 only
+  extract(image_bytes)             -> {text, fields}  # both stages
+  warmup()                                            # preload the local models
 """
 
 import base64
@@ -19,11 +32,23 @@ import os
 import re
 import threading
 
-from PIL import Image
+# Reduce CUDA fragmentation before torch binds — the 4-bit 27B leaves only ~6GB
+# of headroom on a 24GB L4, so fragmentation is the difference between fitting and
+# OOM. setdefault so an explicit env still wins. (torch is imported lazily below,
+# so this lands before the CUDA allocator is created.)
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+from PIL import Image, ImageOps
 
 from data import NOTE_FIELDS
 
-PROVIDER = os.getenv("OCR_PROVIDER", "medgemma").lower()
+# Two independently-swappable stages. OCR_PROVIDER is kept as a back-compat
+# shortcut: if set, it forces BOTH stages onto that provider (the old behaviour).
+_LEGACY = os.getenv("OCR_PROVIDER")
+TRANSCRIBE_PROVIDER = (_LEGACY or os.getenv("TRANSCRIBE_PROVIDER", "qwen")).lower()
+EXTRACT_PROVIDER = (_LEGACY or os.getenv("EXTRACT_PROVIDER", "medgemma")).lower()
+# Legacy alias some callers still read (e.g. the /healthz endpoint).
+PROVIDER = EXTRACT_PROVIDER
 # Upper bound on generated tokens. generate() requires *a* cap (without one,
 # transformers falls back to max_length=20). It's a ceiling, not a target —
 # the model stops at EOS when the JSON is done, so a high value is ~free.
@@ -39,65 +64,117 @@ TRANSCRIBE_PROMPT = (
     "[illegible]. Output only the transcription."
 )
 
-_FIELD_TEMPLATE = ",\n".join(f'  "{k}": ""' for k in _FIELD_KEYS)
-EXTRACT_PROMPT = (
-    "Read this handwritten clinical note and return ONLY a JSON object — no thinking, "
-    "no explanation, no markdown fences, nothing but the JSON. Use exactly these keys:\n"
+# Stage-2 prompt: strict field-routing rules, but the input is a clean TEXT
+# transcript (from stage 1) instead of the image, and we don't ask for
+# raw_transcript back — we already have it. MedGemma reasons over text here, which
+# is what it's good at.
+_TEXT_FIELD_TEMPLATE = ",\n".join(f'  "{k}": ""' for k in _FIELD_KEYS)
+_EXTRACT_FROM_TEXT_HEAD = (
+    "Below is the full transcript of a handwritten clinical note. Return ONLY a JSON "
+    "object — no thinking, no explanation, no markdown fences, nothing but the JSON. "
+    "Use exactly these keys:\n"
     "{\n"
-    '  "raw_transcript": "",\n'
-    f"{_FIELD_TEMPLATE}\n"
+    f"{_TEXT_FIELD_TEMPLATE}\n"
     "}\n"
-    'Set "raw_transcript" to the full verbatim transcription of the note. Then fill the '
-    "section fields (chief_complaint, hpi, pmhx, fmhx, shx, ros, pe, assessment, plan, "
-    "note_type) ONLY from information explicitly present in the note.\n"
+    "Fill the section fields (chief_complaint, hpi, pmhx, fmhx, shx, ros, pe, assessment, "
+    "plan, note_type) ONLY from information explicitly present in the transcript.\n"
     "STRICT RULES — accuracy matters far more than completeness:\n"
     '- Most notes fill only a FEW sections. Leaving a field as "" is correct and expected; '
     "an empty field is better than a wrong one.\n"
-    '- If the note contains nothing for a section, set it to "". Do NOT guess, infer, or '
-    "substitute the closest-looking text from elsewhere.\n"
+    '- If the transcript contains nothing for a section, set it to "". Do NOT guess, infer, '
+    "or substitute the closest-looking text from elsewhere.\n"
     "- Never copy one field's content into another (e.g. do not repeat the chief complaint "
     "in pmhx or assessment).\n"
     "- Put each piece of information in the single most appropriate field; never duplicate "
     "it across fields.\n"
     "- Do not pad, extend, or repeat list items; include only what is actually written.\n"
-    "Do not invent information. Your entire response must start with { and end with }."
+    "Do not invent information. Your entire response must start with { and end with }.\n"
 )
 
 
+def _extract_from_text_prompt(transcript: str) -> str:
+    return (
+        f"{_EXTRACT_FROM_TEXT_HEAD}\n"
+        "=== TRANSCRIPT ===\n"
+        f"{transcript.strip()}\n"
+        "=== END TRANSCRIPT ==="
+    )
+
+
+# Auto-orient before the model reads. MedGemma cannot read sideways/upside-down
+# handwriting — accuracy collapses to ~0 and it won't self-rotate — so we rotate
+# the photo upright first. Tesseract's Orientation-and-Script Detection (OSD)
+# picks the 0/90/180/270 that stands the text up. Best-effort: if tesseract is
+# missing or unsure, we leave the image untouched.
+ORIENT = os.getenv("ORIENT", "1") == "1"
+# OSD is trained on printed text and gets shaky on pure handwriting; ignore a
+# rotation call unless its confidence clears this bar.
+ORIENT_MIN_CONF = float(os.getenv("ORIENT_MIN_CONF", "2.0"))
+
+
+def _orient_upright(img: Image.Image) -> Image.Image:
+    if not ORIENT:
+        return img
+    # 1) Honor the camera's own EXIF orientation (reliable; matters for phone
+    #    captures in the live app — sips already baked it into the eval JPGs).
+    img = ImageOps.exif_transpose(img)
+    # 2) Then use OSD for paper-relative rotation (note laid down sideways).
+    #    Detect on a downscaled probe — orientation doesn't need 12MP, and
+    #    full-res OSD is several seconds per image.
+    try:
+        import pytesseract
+
+        probe = img
+        if max(img.size) > 1600:
+            probe = img.copy()
+            probe.thumbnail((1600, 1600))
+        osd = pytesseract.image_to_osd(probe, output_type=pytesseract.Output.DICT)
+        rot = int(osd.get("rotate", 0)) % 360
+        if rot and float(osd.get("orientation_conf", 0)) >= ORIENT_MIN_CONF:
+            # OSD 'rotate' is the clockwise degrees needed to make text upright;
+            # PIL rotate() is counter-clockwise, so negate. Applied to full res.
+            img = img.rotate(-rot, expand=True)
+    except Exception:  # noqa: BLE001 - tesseract absent / OSD failed: use as-is
+        pass
+    return img
+
+
 def _pil(image_bytes: bytes) -> Image.Image:
-    return Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    return _orient_upright(Image.open(io.BytesIO(image_bytes)).convert("RGB"))
 
 
 # ---------------------------------------------------------------- MedGemma (local)
 _MODEL_ID = "google/medgemma-1.5-4b-it"
-_pipe = None
-_pipe_lock = threading.Lock()
+_model = None
+_proc = None
+_device = None
+_model_lock = threading.Lock()
 
 
-def _load_pipe():
-    global _pipe
-    if _pipe is None:
-        with _pipe_lock:
-            if _pipe is None:
+def _load_model():
+    """Load MedGemma directly (model + processor) rather than the high-level
+    pipeline: we need to prefill the assistant turn to suppress the model's
+    trained-in 'thinking', which the pipeline can't do."""
+    global _model, _proc, _device
+    if _model is None:
+        with _model_lock:
+            if _model is None:
                 import torch
-                from transformers import pipeline
+                from transformers import AutoModelForImageTextToText, AutoProcessor
 
                 if torch.cuda.is_available():
-                    device, dtype = "cuda", torch.bfloat16
+                    _device, dtype = "cuda", torch.bfloat16
                 elif torch.backends.mps.is_available():
-                    device, dtype = "mps", torch.float16
+                    _device, dtype = "mps", torch.float16
                 else:
-                    device, dtype = "cpu", torch.float32
-                _pipe = pipeline(
-                    "image-text-to-text",
-                    model=_MODEL_ID,
-                    torch_dtype=dtype,
-                    device=device,
-                )
-    return _pipe
+                    _device, dtype = "cpu", torch.float32
+                _proc = AutoProcessor.from_pretrained(_MODEL_ID)
+                _model = AutoModelForImageTextToText.from_pretrained(
+                    _MODEL_ID, dtype=dtype, device_map=_device).eval()
+    return _model, _proc
 
 
-def _conv(image_bytes: bytes, prompt: str) -> list:
+def _messages(image_bytes: bytes, prompt: str) -> list:
     return [{
         "role": "user",
         "content": [
@@ -107,34 +184,176 @@ def _conv(image_bytes: bytes, prompt: str) -> list:
     }]
 
 
-def _out_text(o) -> str:
-    # A pipeline call on one conversation returns [{"generated_text": [...]}];
-    # in a batch each element may be that list or the bare dict. Handle both.
-    d = o[0] if isinstance(o, list) else o
-    return d["generated_text"][-1]["content"].strip()
+# Repetition control + thinking suppression. MedGemma-1.5 greedy-decodes into
+# repetition loops on handwriting, and its trained-in "thinking" (<unused94>thought
+# …) spirals on dense forms — burning the whole token budget before any JSON is
+# emitted. So on the extract path we PREFILL the assistant turn with "{": the model
+# starts the JSON immediately and never enters the thinking block (~5x faster, far
+# more reliable). A repetition_penalty still guards against loops; no_repeat_ngram
+# is NOT used — it corrupts JSON and wrecks free-text transcription.
+TRANSCRIBE_GEN = {"repetition_penalty": 1.3}
+EXTRACT_GEN = {"repetition_penalty": 1.3}
+EXTRACT_PREFILL = "{"
 
 
-# Repetition controls for free-text transcription (handwriting can send the
-# model into "[illegible]" loops). Not used for the JSON extraction call, where
-# a no-repeat-ngram constraint would corrupt the JSON structure.
-TRANSCRIBE_GEN = {"repetition_penalty": 1.3, "no_repeat_ngram_size": 3}
+def _medgemma_generate(msgs: list, prefill: str | None = None, **gen) -> str:
+    """Core generate loop, shared by the image and text-only paths."""
+    import torch
+
+    model, proc = _load_model()
+    if prefill is not None:
+        # Continue a partial assistant message so generation resumes after `prefill`.
+        msgs = msgs + [{"role": "assistant", "content": [{"type": "text", "text": prefill}]}]
+        inputs = proc.apply_chat_template(
+            msgs, add_generation_prompt=False, continue_final_message=True,
+            tokenize=True, return_dict=True, return_tensors="pt")
+    else:
+        inputs = proc.apply_chat_template(
+            msgs, add_generation_prompt=True,
+            tokenize=True, return_dict=True, return_tensors="pt")
+    inputs = {k: v.to(_device) for k, v in inputs.items()}
+    n_in = inputs["input_ids"].shape[1]
+    with torch.inference_mode():
+        out = model.generate(**inputs, max_new_tokens=MAX_NEW_TOKENS, do_sample=False, **gen)
+    text = proc.decode(out[0][n_in:], skip_special_tokens=True)
+    return (prefill + text) if prefill else text
 
 
-def _medgemma_run(image_bytes: bytes, prompt: str, **gen) -> str:
-    out = _load_pipe()(text=_conv(image_bytes, prompt), max_new_tokens=MAX_NEW_TOKENS, **gen)
-    return _out_text(out[0])
+def _medgemma_run(image_bytes: bytes, prompt: str, prefill: str | None = None, **gen) -> str:
+    return _medgemma_generate(_messages(image_bytes, prompt), prefill, **gen)
 
 
-def _medgemma_run_batch(image_list: list[bytes], prompt: str, **gen) -> list[str]:
-    """One generate call over several images. Falls back to per-image on error
-    (e.g. OOM), so a too-large batch degrades gracefully instead of crashing."""
-    convs = [_conv(b, prompt) for b in image_list]
-    pipe = _load_pipe()
-    try:
-        out = pipe(text=convs, max_new_tokens=MAX_NEW_TOKENS, batch_size=len(convs), **gen)
-        return [_out_text(o) for o in out]
-    except Exception:  # noqa: BLE001 - degrade to per-image
-        return [_out_text(pipe(text=c, max_new_tokens=MAX_NEW_TOKENS, **gen)[0]) for c in convs]
+def _medgemma_text_run(prompt: str, prefill: str | None = None, **gen) -> str:
+    """Text-only MedGemma (stage 2): reasons over the transcript, no image."""
+    msgs = [{"role": "user", "content": [{"type": "text", "text": prompt}]}]
+    return _medgemma_generate(msgs, prefill, **gen)
+
+
+# ---------------------------------------------------------------- Qwen (local, stage 1)
+# Qwen3-VL is a vision model with markedly better handwriting OCR than MedGemma.
+# It's an image-text-to-text model, so the same AutoModelForImageTextToText /
+# AutoProcessor pair that loads MedGemma loads it too — just a different repo.
+#
+# Default is the dense 8B: it fits a 24GB L4 in bf16 (~16GB) with headroom, runs
+# standard (fast) attention, and is the non-thinking Instruct variant. The 27B
+# (Qwen/Qwen3.6-27B) is stronger but needs 4-bit on an L4 AND runs a slow torch
+# fallback for its Gated-DeltaNet layers (~10x slower) — use it only on a big card
+# (set QWEN_MODEL + QWEN_QUANT=1). See the two-model note in extract_batch.
+_QWEN_ID = os.getenv("QWEN_MODEL", "Qwen/Qwen3-VL-8B-Instruct")
+# bf16 by default (the 8B fits). Set QWEN_QUANT=1 to 4-bit a bigger checkpoint.
+_QWEN_QUANT = os.getenv("QWEN_QUANT", "0") == "1"
+# Vision tokens scale with pixel count, and on a 24GB L4 they're the main OOM
+# risk (a 12MP phone photo is thousands of image tokens). Cap the long side so a
+# full-page note still fits alongside the 4-bit weights. 1600px keeps handwriting
+# legible while staying in budget; raise on a bigger card.
+_QWEN_MAX_SIDE = int(os.getenv("QWEN_MAX_SIDE", "1600"))
+# A note transcript is rarely more than ~1500 tokens; capping generation keeps the
+# KV cache small (more headroom) and avoids runaway decoding.
+_QWEN_MAX_NEW_TOKENS = int(os.getenv("QWEN_MAX_NEW_TOKENS", "1536"))
+_qwen_model = None
+_qwen_proc = None
+_qwen_device = None
+_qwen_lock = threading.Lock()
+
+# Qwen greedy-decodes cleanly on handwriting; it doesn't need MedGemma's heavy
+# repetition_penalty (which would hurt verbatim transcription). A light nudge only.
+QWEN_TRANSCRIBE_GEN = {"repetition_penalty": 1.05}
+
+
+def _qwen_image(image_bytes: bytes) -> Image.Image:
+    """Orient upright, then cap the long side to bound the vision-token count."""
+    img = _pil(image_bytes)
+    if max(img.size) > _QWEN_MAX_SIDE:
+        img = img.copy()
+        img.thumbnail((_QWEN_MAX_SIDE, _QWEN_MAX_SIDE))
+    return img
+
+
+def _load_qwen():
+    global _qwen_model, _qwen_proc, _qwen_device
+    if _qwen_model is None:
+        with _qwen_lock:
+            if _qwen_model is None:
+                import torch
+                from transformers import AutoModelForImageTextToText, AutoProcessor
+
+                kwargs: dict = {}
+                if torch.cuda.is_available():
+                    _qwen_device = "cuda"
+                    if _QWEN_QUANT:
+                        from transformers import BitsAndBytesConfig
+
+                        kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_compute_dtype=torch.bfloat16,
+                        )
+                        # bitsandbytes needs an accelerate device_map; "auto" lands on
+                        # the single GPU made visible via CUDA_VISIBLE_DEVICES.
+                        kwargs["device_map"] = "auto"
+                    else:
+                        kwargs["dtype"] = torch.bfloat16
+                        kwargs["device_map"] = _qwen_device
+                elif torch.backends.mps.is_available():
+                    _qwen_device = "mps"
+                    kwargs["dtype"], kwargs["device_map"] = torch.float16, "mps"
+                else:
+                    _qwen_device = "cpu"
+                    kwargs["dtype"] = torch.float32
+                _qwen_proc = AutoProcessor.from_pretrained(_QWEN_ID)
+                _qwen_model = AutoModelForImageTextToText.from_pretrained(
+                    _QWEN_ID, **kwargs).eval()
+    return _qwen_model, _qwen_proc
+
+
+def _free_qwen() -> None:
+    """Release the vision model from the GPU so the extractor can load without the
+    two co-residing on a single card. Safe to call when nothing is loaded."""
+    global _qwen_model
+    if _qwen_model is not None:
+        import gc
+
+        import torch
+
+        _qwen_model = None
+        gc.collect()
+        try:
+            torch.cuda.empty_cache()
+        except Exception:  # noqa: BLE001 - no CUDA / already gone
+            pass
+
+
+def _qwen_transcribe(image_bytes: bytes) -> str:
+    import torch
+
+    model, proc = _load_qwen()
+    msgs = [{
+        "role": "user",
+        "content": [
+            {"type": "image", "image": _qwen_image(image_bytes)},
+            {"type": "text", "text": TRANSCRIBE_PROMPT},
+        ],
+    }]
+    # Qwen3.6 is a hybrid *thinking* model: left on, it spends the whole token
+    # budget reasoning ("The user wants me to transcribe...") and never reaches the
+    # transcript. enable_thinking=False injects an empty <think></think> so it
+    # answers directly — correct output AND far fewer tokens (critical: decode runs
+    # the slow torch fallback here, the fast DeltaNet kernels won't build on CUDA 13).
+    inputs = proc.apply_chat_template(
+        msgs, add_generation_prompt=True, enable_thinking=False,
+        tokenize=True, return_dict=True, return_tensors="pt")
+    inputs = {k: v.to(_qwen_device) for k, v in inputs.items()}
+    n_in = inputs["input_ids"].shape[1]
+    with torch.inference_mode():
+        out = model.generate(**inputs, max_new_tokens=_QWEN_MAX_NEW_TOKENS,
+                             do_sample=False, **QWEN_TRANSCRIBE_GEN)
+    del inputs
+    text = proc.decode(out[0][n_in:], skip_special_tokens=True).strip()
+    torch.cuda.empty_cache()
+    # Defensive: if a think block still slips through, keep only the answer after it.
+    if "</think>" in text:
+        text = text.rsplit("</think>", 1)[-1].strip()
+    return text
 
 
 # ---------------------------------------------------------------- Claude (cloud)
@@ -161,20 +380,20 @@ def _claude_run(image_bytes: bytes, prompt: str) -> str:
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
-def _claude_extract_json(image_bytes: bytes) -> str:
-    """Claude with a JSON schema so the output is guaranteed-parseable."""
+def _claude_fields_from_text(transcript: str) -> str:
+    """Stage-2 Claude: fields-only JSON from a text transcript (no image)."""
     client, model = _claude_client()
     schema = {
         "type": "object",
-        "properties": {"raw_transcript": {"type": "string"},
-                       **{k: {"type": "string"} for k in _FIELD_KEYS}},
-        "required": ["raw_transcript", *_FIELD_KEYS],
+        "properties": {k: {"type": "string"} for k in _FIELD_KEYS},
+        "required": list(_FIELD_KEYS),
         "additionalProperties": False,
     }
     resp = client.messages.create(
         model=model,
         max_tokens=2000,
-        messages=[{"role": "user", "content": [_claude_image_block(image_bytes), {"type": "text", "text": EXTRACT_PROMPT}]}],
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": _extract_from_text_prompt(transcript)}]}],
         output_config={"format": {"type": "json_schema", "schema": schema}},
     )
     return "".join(b.text for b in resp.content if b.type == "text").strip()
@@ -210,60 +429,97 @@ def _salvage_fields(text: str) -> dict:
 
 
 def warmup():
-    """Preload the local model AND run a tiny generation so CUDA kernels are
-    compiled at startup — the first real scan is then fast, not cold."""
-    if PROVIDER != "medgemma":
-        return
+    """Preload whichever local models the two stages use AND run a tiny generation
+    so CUDA kernels are compiled at startup — the first real scan is then fast, not
+    cold. Best-effort; API-backed stages are no-ops."""
     try:
-        pipe = _load_pipe()
-        messages = [{
-            "role": "user",
-            "content": [
-                {"type": "image", "image": Image.new("RGB", (64, 64), "white")},
-                {"type": "text", "text": "ok"},
-            ],
-        }]
-        pipe(text=messages, max_new_tokens=1)
+        import torch
+
+        if TRANSCRIBE_PROVIDER == "qwen":
+            model, proc = _load_qwen()
+            inputs = proc.apply_chat_template(
+                _messages_stub(), add_generation_prompt=True,
+                tokenize=True, return_dict=True, return_tensors="pt")
+            inputs = {k: v.to(_qwen_device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                model.generate(**inputs, max_new_tokens=1, do_sample=False)
+        if TRANSCRIBE_PROVIDER == "medgemma" or EXTRACT_PROVIDER == "medgemma":
+            model, proc = _load_model()
+            inputs = proc.apply_chat_template(
+                _messages_stub(), add_generation_prompt=True,
+                tokenize=True, return_dict=True, return_tensors="pt")
+            inputs = {k: v.to(_device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                model.generate(**inputs, max_new_tokens=1, do_sample=False)
     except Exception:  # noqa: BLE001 - warmup is best-effort
         pass
 
 
+def _messages_stub() -> list:
+    return [{
+        "role": "user",
+        "content": [
+            {"type": "image", "image": Image.new("RGB", (64, 64), "white")},
+            {"type": "text", "text": "ok"},
+        ],
+    }]
+
+
 def transcribe(image_bytes: bytes) -> str:
-    if PROVIDER == "claude":
+    """Stage 1: image -> verbatim transcript."""
+    if TRANSCRIBE_PROVIDER == "claude":
         return _claude_run(image_bytes, TRANSCRIBE_PROMPT)
-    return _medgemma_run(image_bytes, TRANSCRIBE_PROMPT, **TRANSCRIBE_GEN)
+    if TRANSCRIBE_PROVIDER == "medgemma":
+        return _medgemma_run(image_bytes, TRANSCRIBE_PROMPT, **TRANSCRIBE_GEN)
+    return _qwen_transcribe(image_bytes)
+
+
+def extract_fields_from_text(transcript: str) -> dict:
+    """Stage 2: transcript text -> {note_key: value}. Text-only; no image."""
+    if not transcript.strip():
+        return {k: "" for k in _FIELD_KEYS}
+    if EXTRACT_PROVIDER == "claude":
+        raw = _claude_fields_from_text(transcript)
+    else:
+        raw = _medgemma_text_run(
+            _extract_from_text_prompt(transcript), prefill=EXTRACT_PREFILL, **EXTRACT_GEN)
+    return _assemble_fields(raw)
 
 
 def extract(image_bytes: bytes) -> dict:
-    """One call: image -> {text: transcript, fields: {note_key: value}}.
+    """Both stages: image -> {text: transcript, fields: {note_key: value}}.
 
-    Falls back to {text: <raw output>, fields: {}} if the model's JSON can't be
-    parsed, so the UI can still show the transcription.
+    Stage 1 transcribes the image (Qwen by default); stage 2 routes that clean
+    transcript into fields (MedGemma by default). Field JSON that can't be parsed
+    degrades to empty fields, so the UI can still show the transcription.
     """
-    if PROVIDER == "claude":
-        raw = _claude_extract_json(image_bytes)
-    else:
-        raw = _medgemma_run(image_bytes, EXTRACT_PROMPT)
-    return _assemble(raw)
+    transcript = transcribe(image_bytes)
+    return {"text": transcript, "fields": extract_fields_from_text(transcript)}
 
 
-def _assemble(raw: str) -> dict:
-    """Turn one model response into {text, fields}, salvaging broken JSON."""
+def _flat(v) -> str:
+    """Model sometimes returns a field as a JSON array of items — join to text."""
+    if isinstance(v, list):
+        return "\n".join(str(x).strip() for x in v if str(x).strip())
+    return str(v or "").strip()
+
+
+def _assemble_fields(raw: str) -> dict:
+    """Turn one stage-2 response into {note_key: value}, salvaging broken JSON."""
     try:
         data = _parse_json(raw)
-        fields = {k: str(data.get(k) or "").strip() for k in _FIELD_KEYS}
-        transcript = str(data.get("raw_transcript") or "").strip()
+        return {k: _flat(data.get(k)) for k in _FIELD_KEYS}
     except Exception:  # noqa: BLE001 - JSON malformed/truncated: salvage per-key
-        fields = _salvage_fields(raw)
-        transcript = _regex_value(raw, "raw_transcript")
-
-    if not transcript:
-        transcript = "\n".join(v for v in fields.values() if v) or raw.strip()
-    return {"text": transcript, "fields": fields}
+        return _salvage_fields(raw)
 
 
 def extract_batch(image_list: list[bytes]) -> list[dict]:
-    """extract() over several images in one generate call (local path only)."""
-    if PROVIDER == "claude":
-        return [extract(b) for b in image_list]
-    return [_assemble(raw) for raw in _medgemma_run_batch(image_list, EXTRACT_PROMPT)]
+    """extract() over several images, in two passes: transcribe ALL of them, free
+    the vision model, then extract fields for ALL of them. This keeps the two
+    models from co-residing on a single 24GB card (which OOMs) and is why the batch
+    path exists separately from per-image extract(). Per-image within each stage —
+    batched generation isn't worth the padding complexity on this hardware."""
+    transcripts = [transcribe(b) for b in image_list]
+    if TRANSCRIBE_PROVIDER == "qwen" and EXTRACT_PROVIDER == "medgemma":
+        _free_qwen()  # release ~16GB before MedGemma loads
+    return [{"text": t, "fields": extract_fields_from_text(t)} for t in transcripts]

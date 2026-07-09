@@ -28,6 +28,7 @@ from datetime import date
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
 import qrcode
@@ -45,8 +46,9 @@ async def lifespan(app: FastAPI):
     yield
 
 
-app = FastAPI(title="MediSnap EHR", lifespan=lifespan)
+app = FastAPI(title="Depaperfy EHR", lifespan=lifespan)
 templates = Jinja2Templates(directory="templates")
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # Field-extraction eval review UI (reads eval/runs/*; loads no model itself).
 app.include_router(eval_router)
@@ -186,4 +188,9 @@ async def upload_photo(session_id: str, image: UploadFile = File(...)):
 
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "ocr_provider": ocr.PROVIDER, "base_url": _base_url()}
+    return {
+        "status": "ok",
+        "transcribe_provider": ocr.TRANSCRIBE_PROVIDER,
+        "extract_provider": ocr.EXTRACT_PROVIDER,
+        "base_url": _base_url(),
+    }
