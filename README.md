@@ -103,12 +103,20 @@ Scan sessions live in memory with a 30-minute expiry — fine for a demo.
 
 ### The reading pipeline
 
-The pipeline is deliberately simple — a fixed, two-step transformation:
+Handwritten notes use a **two-stage** split — the right model for each half,
+because MedGemma is a strong clinical *reasoner* but a weak *reader*:
 
 ```
-photo ──▶ [vision model: read the image]  ──▶  [structure it]  ──▶  note fields
-                                                                    or lab table
+photo ──▶ [stage 1: Qwen3-VL transcribes]  ──▶  [stage 2: MedGemma routes the
+                                                 transcript into note fields
+                                                 + patient identifiers]
 ```
+
+Stage 1 (`TRANSCRIBE_PROVIDER`, default `qwen`) does the OCR; stage 2
+(`EXTRACT_PROVIDER`, default `medgemma`) reasons over the clean text — never the
+image. On a single 24GB card the two are loaded one at a time (the vision model
+is freed before the router loads). Lab reports are printed, not handwritten, so
+they skip stage 1 and the extraction model reads the image directly.
 
 For lab reports the structuring step doesn't assume a fixed layout: the table's
 columns are derived from whatever the report actually contains (a chemistry panel
@@ -142,7 +150,10 @@ All via environment variables (or a `.env` file — see `.env.example`):
 
 | Variable | Purpose |
 |---|---|
-| `OCR_PROVIDER` | `medgemma` (default) or `claude` |
+| `OCR_PROVIDER` | Back-compat shortcut: forces BOTH stages onto one provider (`medgemma` or `claude`) |
+| `TRANSCRIBE_PROVIDER` | Stage 1 (OCR): `qwen` (default), `medgemma`, or `claude` |
+| `EXTRACT_PROVIDER` | Stage 2 (field routing): `medgemma` (default) or `claude` |
+| `OCR_ENGINE` | Local serving engine: `transformers` (default) or `vllm`. vLLM accelerates the **batch** path (`extract_batch`) with paged attention, continuous batching, and JSON-schema-constrained stage-2 decoding; the single-scan path stays on transformers. Needs the `medgemma` extra (Linux/CUDA). |
 | `ANTHROPIC_API_KEY` | Required for the Claude provider |
 | `CLAUDE_MODEL` | Override the Claude model (default `claude-opus-4-8`) |
 | `HF_TOKEN` | Hugging Face token for the gated MedGemma download |
