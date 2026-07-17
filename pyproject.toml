@@ -15,14 +15,31 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# The on-device MedGemma path. Heavy (~2GB+ of ML wheels) and only needed when
-# OCR_PROVIDER=medgemma — the cloud/Claude path runs without it.
+# The on-device inference stack for the two-stage reader (Qwen transcribe ->
+# MedGemma route) and the lab-report path. Heavy (~2GB+ of ML wheels) and only
+# needed for the local providers — the cloud/Claude path runs without it.
 #   uv sync --extra medgemma
 medgemma = [
-    "transformers>=4.53",
+    # Qwen3.6-27B (model_type "qwen3_5") is recent — it needs a new transformers.
+    "transformers>=4.57",
     "torch>=2.4",
     "accelerate>=1.0",
     "huggingface-hub>=0.26",
+    # Orientation: tesseract OSD stands sideways photos upright before the read.
+    "pytesseract>=0.3.10",
+    # 4-bit quantization for a 27B on a 24GB L4 (QWEN_QUANT). CUDA only, so scope
+    # to Linux to keep macOS installs working.
+    "bitsandbytes>=0.43; sys_platform == 'linux'",
+]
+
+# vLLM serving for the batch path (OCR_ENGINE=vllm). Deliberately a SEPARATE extra
+# from `medgemma`: vLLM pins its own torch, which can downgrade the transformers
+# stack, so opt in only when you want the accelerated batch path.
+#   uv sync --extra medgemma --extra vllm
+# CUDA/Linux only; the StructuredOutputsParams API used in ocr.py needs vLLM v0.12+
+# (verified on 0.25.1).
+vllm = [
+    "vllm>=0.12; sys_platform == 'linux'",
 ]
 
 [tool.uv]
