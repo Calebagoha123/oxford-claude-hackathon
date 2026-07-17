@@ -9,18 +9,25 @@ services:
   app:
     build: .
     image: medisnap
+    # Same port inside and out so the app's advertised base_url / QR (which use
+    # PORT) match what the host publishes.
     ports:
-      - "${PORT:-8000}:8000"
+      - "${PORT:-8000}:${PORT:-8000}"
     environment:
       # Gated MedGemma/Qwen weights need a Hugging Face token on first download.
       - HF_TOKEN=${HF_TOKEN:-}
-      # Provider / engine knobs (see README). Defaults match the app's own
-      # defaults, so leaving them unset is fine.
-      - OCR_PROVIDER=${OCR_PROVIDER:-}
-      - TRANSCRIBE_PROVIDER=${TRANSCRIBE_PROVIDER:-}
-      - EXTRACT_PROVIDER=${EXTRACT_PROVIDER:-}
-      - OCR_ENGINE=${OCR_ENGINE:-}
+      # Provider / engine knobs (see README). BARE passthrough (no "=value"): these
+      # forward ONLY when set on the host, so the app's own getenv() defaults apply
+      # inside the container. Do NOT write `${VAR:-}` here — that injects an EMPTY
+      # STRING, which overrides the code default (e.g. OCR_PROVIDER would become ""
+      # instead of "medgemma", silently disabling warmup()).
+      - OCR_PROVIDER
+      - TRANSCRIBE_PROVIDER
+      - EXTRACT_PROVIDER
+      - OCR_ENGINE
       - WARMUP=${WARMUP:-1}
+      # uvicorn honours PORT (Dockerfile CMD); keep it aligned with the port mapping.
+      - PORT=${PORT:-8000}
       # Set to a tunnel URL when the phone can't reach the host over the LAN.
       - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
@@ -37,8 +44,9 @@ services:
               capabilities: [gpu]
     healthcheck:
       # The venv python is on PATH (set in the Dockerfile); no curl in the image.
+      # Reads PORT so the check follows a custom port.
       test: ["CMD", "python", "-c",
-             "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+             "import os,urllib.request; urllib.request.urlopen('http://localhost:'+os.environ.get('PORT','8000')+'/healthz')"]
       interval: 30s
       timeout: 5s
       retries: 3
