@@ -3,4 +3,18 @@
 __pycache__
 *.pyc
 .env
-README.md
+*.md
+.DS_Store
+
+# Not part of the live app image (the COPY *.py glob would otherwise grab them):
+# the eval pipeline/review UI and their Cloud Run entrypoint live elsewhere.
+eval_pipeline.py
+eval_ui.py
+judge.py
+serve_eval.py
+tests
+eval
+tools
+static
+.ruff_cache
+.pytest_cache

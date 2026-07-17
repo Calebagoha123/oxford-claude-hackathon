@@ -1,0 +1,50 @@
+# One-command run of the on-device app (EHR + handwritten-note OCR) on a Linux
+# GPU host. Wraps the long `docker run --gpus all -v ... -e ...` invocation.
+#
+#   HF_TOKEN=hf_... docker compose up --build     # or put HF_TOKEN in a .env file
+#
+# Requires the NVIDIA Container Toolkit on the host (so the container sees the
+# GPU). Docker on macOS cannot reach the Mac GPU — use `uv run` there instead.
+services:
+  app:
+    build: .
+    image: medisnap
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # Gated MedGemma/Qwen weights need a Hugging Face token on first download.
+      - HF_TOKEN=${HF_TOKEN:-}
+      # Provider / engine knobs (see README). Defaults match the app's own
+      # defaults, so leaving them unset is fine.
+      - OCR_PROVIDER=${OCR_PROVIDER:-}
+      - TRANSCRIBE_PROVIDER=${TRANSCRIBE_PROVIDER:-}
+      - EXTRACT_PROVIDER=${EXTRACT_PROVIDER:-}
+      - OCR_ENGINE=${OCR_ENGINE:-}
+      - WARMUP=${WARMUP:-1}
+      # Set to a tunnel URL when the phone can't reach the host over the LAN.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+    # Persist the ~tens-of-GB model weights across container restarts so they're
+    # downloaded once, not on every `up`. Matches HF_HOME in the Dockerfile.
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    healthcheck:
+      # The venv python is on PATH (set in the Dockerfile); no curl in the image.
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      # Model warmup can take a while on first boot — don't fail health early.
+      start_period: 300s
+    restart: unless-stopped
+
+volumes:
+  hf-cache:
