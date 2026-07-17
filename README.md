@@ -179,3 +179,17 @@ GPU host. Docker on macOS can't reach the Mac GPU — run with `uv` there instea
 docker build -t medisnap .
 docker run --rm --gpus all -p 8000:8000 -e HF_TOKEN=hf_... medisnap
 ```
+
+Or, with Compose (handles the GPU flag, a persistent weights volume, and env for
+you):
+
+```sh
+HF_TOKEN=hf_... docker compose up --build      # or put vars in a .env file
+```
+
+`docker-compose.yml` reserves the GPU, mounts a named `hf-cache` volume so the
+model weights download once (not on every run), and passes through the provider
+knobs (`OCR_PROVIDER`, `TRANSCRIBE_PROVIDER`, `EXTRACT_PROVIDER`, `OCR_ENGINE`,
+`ANTHROPIC_API_KEY`, `PUBLIC_BASE_URL`). Both paths need the [NVIDIA Container
+Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html)
+on the host.
