@@ -153,7 +153,7 @@ All via environment variables (or a `.env` file — see `.env.example`):
 | `OCR_PROVIDER` | Back-compat shortcut: forces BOTH stages onto one provider (`medgemma` or `claude`) |
 | `TRANSCRIBE_PROVIDER` | Stage 1 (OCR): `qwen` (default), `medgemma`, or `claude` |
 | `EXTRACT_PROVIDER` | Stage 2 (field routing): `medgemma` (default) or `claude` |
-| `OCR_ENGINE` | Local serving engine: `transformers` (default) or `vllm`. vLLM accelerates the **batch** path (`extract_batch`) with paged attention, continuous batching, and JSON-schema-constrained stage-2 decoding; the single-scan path stays on transformers. Needs the `medgemma` extra (Linux/CUDA). |
+| `OCR_ENGINE` | Local serving engine: `transformers` (default) or `vllm`. vLLM accelerates the **batch** path (`extract_batch`) with paged attention, continuous batching, and JSON-schema-constrained stage-2 decoding; the single-scan path stays on transformers. Needs the separate `vllm` extra (`uv sync --extra medgemma --extra vllm`; Linux/CUDA). |
 | `ANTHROPIC_API_KEY` | Required for the Claude provider |
 | `CLAUDE_MODEL` | Override the Claude model (default `claude-opus-4-8`) |
 | `HF_TOKEN` | Hugging Face token for the gated MedGemma download |

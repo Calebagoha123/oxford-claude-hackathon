@@ -30,8 +30,15 @@ medgemma = [
     # 4-bit quantization for a 27B on a 24GB L4 (QWEN_QUANT). CUDA only, so scope
     # to Linux to keep macOS installs working.
     "bitsandbytes>=0.43; sys_platform == 'linux'",
-    # vLLM serving for the batch path (OCR_ENGINE=vllm). CUDA/Linux only; the
-    # StructuredOutputsParams API used in ocr.py needs v0.12+.
+]
+
+# vLLM serving for the batch path (OCR_ENGINE=vllm). Deliberately a SEPARATE extra
+# from `medgemma`: vLLM pins its own torch, which can downgrade the transformers
+# stack, so opt in only when you want the accelerated batch path.
+#   uv sync --extra medgemma --extra vllm
+# CUDA/Linux only; the StructuredOutputsParams API used in ocr.py needs vLLM v0.12+
+# (verified on 0.25.1).
+vllm = [
     "vllm>=0.12; sys_platform == 'linux'",
 ]
 

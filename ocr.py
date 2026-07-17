@@ -421,19 +421,25 @@ def _load_qwen():
 
 def _free_qwen() -> None:
     """Release the vision model from the GPU so the extractor can load without the
-    two co-residing on a single card. Safe to call when nothing is loaded."""
+    two co-residing on a single card. Safe to call when nothing is loaded.
+
+    Takes _qwen_lock (the same lock _load_qwen uses) so a concurrent scan can't be
+    loading the model while we null it out — the live app runs OCR in per-upload
+    threads. Note this still can't help a thread already mid-generate on one card;
+    the real fix for concurrent single-scan is a persistent per-model server."""
     global _qwen_model
-    if _qwen_model is not None:
-        import gc
+    with _qwen_lock:
+        if _qwen_model is not None:
+            import gc
 
-        import torch
+            import torch
 
-        _qwen_model = None
-        gc.collect()
-        try:
-            torch.cuda.empty_cache()
-        except Exception:  # noqa: BLE001 - no CUDA / already gone
-            pass
+            _qwen_model = None
+            gc.collect()
+            try:
+                torch.cuda.empty_cache()
+            except Exception:  # noqa: BLE001 - no CUDA / already gone
+                pass
 
 
 def _qwen_transcribe(image_bytes: bytes) -> str:
