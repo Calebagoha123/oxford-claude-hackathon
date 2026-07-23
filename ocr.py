@@ -555,7 +555,11 @@ def extract(image_bytes: bytes) -> dict:
     transcript into fields (MedGemma by default). Field JSON that can't be parsed
     degrades to empty fields, so the UI can still show the transcription.
     """
+    import time as _time
+
+    _t0 = _time.time()
     transcript = transcribe(image_bytes)
+    _t1 = _time.time()
     # Fallback residency lever: a bf16 Qwen (~16GB) + bf16 MedGemma (~8GB) don't
     # co-reside on a 24GB L4. Preferred fix is MEDGEMMA_QUANT=1 (both resident,
     # ~19GB, no reload). If MedGemma must stay bf16, set FREE_QWEN_AFTER_TRANSCRIBE=1
@@ -563,7 +567,14 @@ def extract(image_bytes: bytes) -> dict:
     # the cost of reloading Qwen on the next scan.
     if os.getenv("FREE_QWEN_AFTER_TRANSCRIBE") == "1":
         _free_qwen()
-    return {"text": transcript, "fields": extract_fields_from_text(transcript)}
+    fields = extract_fields_from_text(transcript)
+    _t2 = _time.time()
+    print(
+        f"[timing] transcribe={_t1 - _t0:.1f}s extract={_t2 - _t1:.1f}s "
+        f"total={_t2 - _t0:.1f}s chars={len(transcript)}",
+        flush=True,
+    )
+    return {"text": transcript, "fields": fields}
 
 
 def _flat(v) -> str:
