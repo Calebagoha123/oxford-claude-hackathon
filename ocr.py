@@ -636,6 +636,19 @@ def _extract_labs_prompt(transcript: str) -> str:
     )
 
 
+# Single-pass variant: the model reads the IMAGE directly and emits {meta, results}
+# in one go, skipping the verbatim transcript. Same shape + rules as the two-stage
+# head, only the framing changes (image, not transcript). Far fewer generated tokens
+# than transcribe+route, so it's markedly faster on clean printed reports — where
+# MedGemma reads well enough that a separate OCR stage buys little.
+_LAB_EXTRACT_IMAGE_HEAD = (
+    "The image is a photograph or scan of a laboratory test report. Read it and "
+    "return ONLY a JSON object — no thinking, no explanation, no markdown fences, "
+    "nothing but the JSON. Use exactly this shape:\n"
+    + _LAB_EXTRACT_HEAD.split("Use exactly this shape:\n", 1)[1]
+)
+
+
 def _norm_flag(v) -> str:
     """Fold the model's flag onto our vocabulary (LAB_FLAGS); normal/unknown -> ""."""
     s = str(v or "").strip().lower()
@@ -732,16 +745,46 @@ def extract_labs_from_text(transcript: str) -> dict:
     return _assemble_labs(raw)
 
 
-def extract_labs(image_bytes: bytes) -> dict:
-    """Both stages for a lab report: image -> {text, meta, results}.
+def extract_labs_single_pass(image_bytes: bytes) -> dict:
+    """One MedGemma pass: image -> {meta, results} directly, skipping the verbatim
+    transcript. Roughly halves generated tokens vs transcribe+route, so it's much
+    faster; the trade is no transcript for the side-by-side (the source photo is
+    still shown). Best on clean printed reports."""
+    raw = _medgemma_run(
+        image_bytes, _LAB_EXTRACT_IMAGE_HEAD, prefill=EXTRACT_PREFILL, **EXTRACT_GEN)
+    out = _assemble_labs(raw)
+    return {"text": "", "meta": out["meta"], "results": out["results"]}
 
-    Stage 1 transcribes the report (Qwen by default); stage 2 routes that clean
-    transcript into a header + a table of analyte rows (MedGemma by default).
-    Structured output that can't be parsed degrades to empty results, so the UI
-    can still show the transcription.
+
+def extract_labs(image_bytes: bytes) -> dict:
+    """Lab report: image -> {text, meta, results}.
+
+    Default is two stages: transcribe (Qwen) then route the transcript into a
+    header + analyte table (MedGemma). With LAB_SINGLE_PASS=1 (MedGemma extractor
+    only) it's one image->{meta, results} pass — far fewer tokens, much faster on
+    clean printed reports, at the cost of the transcript. Unparseable output
+    degrades to empty results so the UI can still show the source photo.
     """
+    import time as _time
+
+    _t0 = _time.time()
+    if os.getenv("LAB_SINGLE_PASS") == "1" and EXTRACT_PROVIDER == "medgemma":
+        out = extract_labs_single_pass(image_bytes)
+        print(
+            f"[timing] lab single-pass total={_time.time() - _t0:.1f}s "
+            f"n_results={len(out['results'])}",
+            flush=True,
+        )
+        return out
     transcript = transcribe(image_bytes)
+    _t1 = _time.time()
     out = extract_labs_from_text(transcript)
+    _t2 = _time.time()
+    print(
+        f"[timing] lab transcribe={_t1 - _t0:.1f}s extract={_t2 - _t1:.1f}s "
+        f"total={_t2 - _t0:.1f}s chars={len(transcript)}",
+        flush=True,
+    )
     return {"text": transcript, "meta": out["meta"], "results": out["results"]}
 
 
