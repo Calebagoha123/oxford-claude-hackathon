@@ -29,6 +29,7 @@ from __future__ import annotations
 import re
 import uuid
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Any, Optional
 
 # ---- fixed, international code systems (not localisation knobs) ----
@@ -57,6 +58,9 @@ class ZaFhirConfig:
     fhir_profile: str = ""
 
     default_country: str = "ZA"
+    # Report headers give a wall-clock time with no zone, but FHIR dateTime requires
+    # one whenever a time is present. Stamp this default (SAST, +02:00, no DST).
+    default_timezone: str = "+02:00"
     bundle_type: str = "collection"     # portable; HAPI/OpenHIE ingest directly
     emit_normal_interpretation: bool = False   # usually only abnormals get a flag
 
@@ -97,11 +101,41 @@ def _gender(g: Any) -> Optional[str]:
     return "unknown" if s else None
 
 
-def _iso(dt: Any) -> Optional[str]:
+# Date/time strings a lab report header uses ("18-Jul-2026 07:42", "2026-07-19"…).
+# FHIR dateTime must be ISO-8601, so a raw header string is INVALID and a strict
+# server rejects the whole bundle — we normalise, and drop the field if we can't
+# (valid-but-absent beats present-but-invalid).
+_DT_FORMATS = (
+    "%d-%b-%Y %H:%M", "%d-%b-%Y", "%d %b %Y %H:%M", "%d %b %Y",
+    "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d",
+    "%d/%m/%Y %H:%M", "%d/%m/%Y",
+)
+
+
+def _normalize_datetime(s: Any, tz: str = "+02:00") -> Optional[str]:
+    """Best-effort header date/time -> valid FHIR dateTime, else None. A time-of-day
+    gets the `tz` offset (FHIR requires a zone when a time is present); a date-only
+    header stays date-only (valid without a zone), so we don't fabricate a time."""
+    t = str(s or "").strip()
+    if not t:
+        return None
+    for fmt in _DT_FORMATS:
+        try:
+            dt = datetime.strptime(t, fmt)
+        except ValueError:
+            continue
+        if "%H" in fmt:                       # source had a time -> needs a zone
+            return dt.isoformat() + tz
+        return dt.date().isoformat()          # date-only, valid as-is
+    # already ISO-ish (starts YYYY-MM-DD)? keep it; otherwise give up.
+    return t if re.match(r"\d{4}-\d{2}-\d{2}", t) else None
+
+
+def _iso(dt: Any, tz: str = "+02:00") -> Optional[str]:
     if dt is None:
         return None
     iso = getattr(dt, "isoformat", None)
-    return iso() if callable(iso) else str(dt)
+    return iso() if callable(iso) else _normalize_datetime(dt, tz)
 
 
 def _meta(cfg: ZaFhirConfig) -> dict:
@@ -124,13 +158,27 @@ def _code(test: Any) -> dict:
     return {"text": name}
 
 
+def _numeric_value(s: Any) -> Optional[float]:
+    """The value as a float only when it's essentially a bare number (optionally a
+    trailing flag like "13.2 H") — NOT a titre "1:8", a qualitative "REACTIVE", a
+    censored ">100", or "Trace". Those must stay valueString, so _num's grab-any-
+    number behaviour (right for ranges) is wrong here."""
+    if isinstance(s, (int, float)):
+        return float(s)
+    if s is None:
+        return None
+    m = re.fullmatch(r"\s*(-?\d+(?:\.\d+)?)\s*(?:[hl*]|hi|lo|high|low)?\s*",
+                     str(s), re.IGNORECASE)
+    return float(m.group(1)) if m else None
+
+
 def _value(test: Any) -> dict:
-    """valueQuantity when the result is numeric, else valueString."""
+    """valueQuantity for a genuinely numeric result, else valueString."""
     result = getattr(test, "result", None)
     if result is None:
         result = getattr(test, "value", None)
     unit = getattr(test, "unit", None) or ""
-    v = _num(result)
+    v = _numeric_value(result)
     if v is not None:
         q: dict = {"value": v}
         if unit:
@@ -248,7 +296,7 @@ def build_za_lab_bundle(lab: Any, cfg: ZaFhirConfig = DEFAULT_ZA_CONFIG) -> dict
     g = _gender(getattr(patient, "gender", None))
     if g:
         p["gender"] = g
-    dob = _iso(getattr(patient, "dob", None))
+    dob = _iso(getattr(patient, "dob", None), cfg.default_timezone)
     if dob:
         p["birthDate"] = dob
     idents = getattr(patient, "identifiers", None)
@@ -280,7 +328,7 @@ def build_za_lab_bundle(lab: Any, cfg: ZaFhirConfig = DEFAULT_ZA_CONFIG) -> dict
         entries.append((prac_ref, {"resourceType": "Practitioner", **_meta(cfg),
                                    "name": [{"text": prac.name}]}))
 
-    eff = _iso(getattr(lab, "sample_collection_time", None))
+    eff = _iso(getattr(lab, "sample_collection_time", None), cfg.default_timezone)
     tests = getattr(lab, "lab_tests", None)
     if tests is None:
         tests = getattr(lab, "results", None) or []
@@ -343,6 +391,11 @@ def build_bundle_from_depaperfy(meta: Optional[dict], results: Optional[list],
     pipeline); the resulting Observations carry `code.text` but no LOINC coding."""
     from types import SimpleNamespace as _NS
 
+    try:  # sibling module; stdlib-only, so no external dependency is added
+        from .loinc_map import lookup as _loinc_lookup
+    except ImportError:  # loaded as a loose module rather than a package
+        from loinc_map import lookup as _loinc_lookup
+
     meta = meta or {}
     patient = _NS(
         name=meta.get("patient_name") or "Unknown",
@@ -352,14 +405,15 @@ def build_bundle_from_depaperfy(meta: Optional[dict], results: Optional[list],
     )
     org = _NS(name=meta.get("performing_lab"), address=None) if meta.get("performing_lab") else None
     panel = meta.get("panel") or None
-    tests = [
-        _NS(test=r.get("test"), name=r.get("test"),
+    tests = []
+    for r in (results or []):
+        code, common = _loinc_lookup(r.get("test"))
+        tests.append(_NS(
+            test=r.get("test"), name=r.get("test"),
             value=r.get("value"), result=r.get("value"),
             unit=r.get("unit"), reference_range=r.get("reference_range"),
             flag=r.get("flag"), panel_name=panel,
-            loinc_code=None, loinc_common_name=None)
-        for r in (results or [])
-    ]
+            loinc_code=code, loinc_common_name=common))
     lab = _NS(patient=patient, service_provider=org, practitioner=None,
               sample_collection_time=meta.get("collected") or None,
               lab_tests=tests, results=tests)
