@@ -3,88 +3,119 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MediSnap — Extraction Eval</title>
+<title>De-paperfy — Extraction review</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=Playfair+Display:ital,wght@1,600&display=swap" rel="stylesheet">
 <style>
   :root {
-    --green-dk:#2f5e2a; --green:#3f7c37; --ink:#1d2630; --alert:#b3110d;
-    --hdr1:#5d92c9; --hdr2:#3f74ad; --panel-bd:#7f97b2; --ok:#1e6b30; --warn:#876b00;
+    --paper:#f2f0ea; --surface:#ffffff; --ink:#23201d; --muted:#7a6f64;
+    --brown:#5b3b2c; --brown-dk:#3d251c;
+    --rule:rgba(60,40,28,.16); --rule-strong:rgba(60,40,28,.32);
+    --green:#1e7a49; --red:#9e3a26;
   }
   * { box-sizing:border-box; }
-  body { margin:0; font-family:Tahoma,Verdana,"Segoe UI",sans-serif; font-size:12px;
-    color:var(--ink); background:#eef0e7; }
-  a { color:#2c4f8a; text-decoration:none; }
-  a:hover { text-decoration:underline; }
-  .app-top { background:linear-gradient(180deg,var(--green),var(--green-dk)); color:#eef6ea;
-    display:flex; align-items:center; gap:.6rem; padding:.4rem .8rem; }
-  .app-top .brand { font-weight:700; font-size:15px; } .app-top .brand b { color:#bfe6a8; }
-  .app-top .product { color:#cfe6c6; font-size:11px; }
-  main { padding:1rem 1.2rem; max-width:1000px; }
-  h1 { font-size:16px; margin:.2rem 0 1rem; }
-  .run { background:#fff; border:1px solid var(--panel-bd); border-radius:3px; margin-bottom:1rem; overflow:hidden; }
-  .run > .ph { background:linear-gradient(180deg,var(--hdr1),var(--hdr2)); color:#fff;
-    font-weight:700; padding:.4rem .7rem; display:flex; align-items:center; gap:.6rem; }
-  .run > .ph .spacer { flex:1; }
-  .run > .bd { padding:.7rem .8rem; }
-  .cards { display:flex; flex-wrap:wrap; gap:.5rem; margin-bottom:.7rem; }
-  .card { background:#f3f6fa; border:1px solid #d3dbe4; border-radius:3px; padding:.4rem .7rem; min-width:120px; }
-  .card .k { font-size:9px; text-transform:uppercase; letter-spacing:.4px; color:#6b7a8d; }
-  .card .v { font-size:18px; font-weight:700; }
-  .card.bad .v { color:var(--alert); } .card.good .v { color:var(--ok); }
-  .imgrid { display:grid; grid-template-columns:repeat(auto-fill,minmax(150px,1fr)); gap:.4rem; }
-  .imgcell { border:1px solid #cdd6c4; border-radius:3px; background:#fafbf7; padding:.4rem .5rem; }
-  .imgcell .nm { font-weight:700; word-break:break-all; }
-  .imgcell .acc { color:#54657a; }
-  .muted { color:#7a8772; }
-  .hint { color:#54657a; font-size:11px; margin:.3rem 0 1rem; }
-  code { background:#eef2f7; padding:.05rem .3rem; border-radius:2px; }
+  body {
+    margin:0; background:var(--paper); color:var(--ink);
+    font-family:Inter,system-ui,-apple-system,"Segoe UI",sans-serif;
+    font-size:14px; line-height:1.55; -webkit-font-smoothing:antialiased;
+  }
+  a { color:inherit; text-decoration:none; }
+  .label { font-size:10.5px; font-weight:600; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); }
+
+  .bar { display:flex; align-items:center; gap:16px; height:56px; padding:0 24px;
+    border-bottom:1px solid var(--rule-strong); }
+  .wordmark { display:flex; align-items:center; gap:9px; }
+  .wordmark img { width:26px; height:26px; }
+  .wordmark b { font-family:"Playfair Display",Georgia,serif; font-style:italic; font-weight:600;
+    font-size:19px; color:var(--brown-dk); }
+  .bar .tag { color:var(--muted); font-size:12.5px; border-left:1px solid var(--rule-strong); padding-left:16px; }
+
+  main { max-width:960px; margin:0 auto; padding:44px 24px 80px; }
+  h1 { font-family:"Playfair Display",Georgia,serif; font-style:italic; font-weight:600;
+    font-size:38px; letter-spacing:-.01em; margin:0 0 6px; color:var(--brown-dk); }
+  .lede { color:var(--muted); margin:0 0 40px; max-width:60ch; }
+  code { font:12.5px ui-monospace,Menlo,Consolas,monospace; background:rgba(60,40,28,.07); padding:1px 6px; }
+
+  .run { margin-bottom:52px; }
+  .run-head { display:flex; align-items:baseline; gap:12px; padding-bottom:12px;
+    border-bottom:2px solid var(--brown-dk); margin-bottom:0; }
+  .run-head h2 { font-size:15px; font-weight:600; margin:0; letter-spacing:.01em; }
+  .run-head .id { font:13px ui-monospace,Menlo,Consolas,monospace; color:var(--muted); }
+  .run-head .spacer { flex:1; }
+  .run-head .cnt { font-size:12.5px; color:var(--muted); }
+  .run-head .download { margin-left:18px; font-size:12.5px; font-weight:600; color:var(--brown);
+    border-bottom:1px solid var(--rule-strong); padding-bottom:1px; }
+  .run-head .download:hover { color:var(--brown-dk); border-color:var(--brown-dk); }
+
+  .stats { display:flex; gap:0; border-bottom:1px solid var(--rule); }
+  .stat { padding:16px 26px 16px 0; margin-right:26px; border-right:1px solid var(--rule); }
+  .stat:last-child { border-right:0; }
+  .stat .v { font-size:26px; font-weight:600; letter-spacing:-.02em; line-height:1; }
+  .stat .k { margin-top:5px; }
+  .stat.good .v { color:var(--green); } .stat.bad .v { color:var(--red); }
+
+  table { width:100%; border-collapse:collapse; margin-top:6px; }
+  thead th { text-align:left; padding:12px 10px; border-bottom:1px solid var(--rule-strong);
+    font-size:10.5px; font-weight:600; letter-spacing:.14em; text-transform:uppercase; color:var(--muted); }
+  thead th.num { width:48px; }
+  thead th.st { width:150px; text-align:right; }
+  tbody td { padding:11px 10px; border-bottom:1px solid var(--rule); }
+  tbody tr { cursor:pointer; }
+  tbody tr:hover td { background:#fbfaf6; }
+  td.num { color:var(--muted); font:12.5px ui-monospace,Menlo,Consolas,monospace; }
+  td.file { font-weight:500; word-break:break-all; }
+  td.st { text-align:right; color:var(--muted); font-size:13px; }
+  td.st .mark { color:var(--green); font-weight:600; }
+  td.st .pending { color:var(--muted); }
+
+  .empty { color:var(--muted); }
 </style>
 </head>
 <body>
-  <div class="app-top">
-    <span class="brand">Medi<b>Snap</b></span>
-    <span class="product">Extraction Eval — 4B fields judged by 27B</span>
-  </div>
+  <header class="bar">
+    <a class="wordmark" href="/eval"><img src="/static/depaperfy-icon.png" alt=""><b>De-paperfy</b></a>
+    <span class="tag">Extraction review</span>
+  </header>
   <main>
-    <h1>Field-extraction evaluation</h1>
+    <h1>Extraction review</h1>
+    <p class="lede">Each note was photographed and read by the model. Open a note to compare the
+      photo and transcript against the fields it filled, and mark every field correct or incorrect.</p>
+
     {% if not runs %}
-      <p class="hint">No eval runs yet. On the VM:
-      <code>uv run --no-sync python eval_pipeline.py run</code> after dropping note photos in
-      <code>eval/images/</code>.</p>
+      <p class="empty">No runs yet. On the server, run
+        <code>python eval_pipeline.py extract</code> after placing note photos in <code>eval/images/</code>.</p>
     {% endif %}
+
     {% for run in runs %}
-    <div class="run">
-      <div class="ph">
-        <span>Run {{ run.id }}</span>
+    {% set s = run.summary %}
+    <section class="run">
+      <div class="run-head">
+        <h2>Run</h2><span class="id">{{ run.id }}</span>
         <span class="spacer"></span>
-        <span>{{ run.n }} note{{ '' if run.n == 1 else 's' }}</span>
+        <span class="cnt">{{ run.n }} note{{ '' if run.n == 1 else 's' }}</span>
+        <a class="download" href="/api/eval/{{ run.id }}/export.csv">Download CSV ↓</a>
       </div>
-      <div class="bd">
-        {% if run.summary %}
-        {% set s = run.summary %}
-        <div class="cards">
-          <div class="card good"><div class="k">Accuracy</div><div class="v">{{ '%.0f' % (s.accuracy*100) if s.accuracy is not none else '—' }}%</div></div>
-          <div class="card"><div class="k">Precision</div><div class="v">{{ '%.0f' % (s.precision*100) if s.precision is not none else '—' }}%</div></div>
-          <div class="card"><div class="k">Recall</div><div class="v">{{ '%.0f' % (s.recall*100) if s.recall is not none else '—' }}%</div></div>
-          <div class="card bad"><div class="k">Hallucination</div><div class="v">{{ '%.0f' % (s.hallucination_rate*100) if s.hallucination_rate is not none else '—' }}%</div></div>
-          <div class="card bad"><div class="k">Mis-route</div><div class="v">{{ '%.0f' % (s.misroute_rate*100) if s.misroute_rate is not none else '—' }}%</div></div>
-          <div class="card"><div class="k">Judge↔Human</div><div class="v">{{ '%.0f' % (s.judge_human_agreement*100) if s.judge_human_agreement is not none else '—' }}%</div></div>
-        </div>
-        <p class="hint">Accuracy counts correctly-empty fields too — read it alongside the
-        hallucination / mis-route rates (the over-population &amp; PE→ROS problems).
-        Judge↔Human is over {{ s.human_reviewed_fields }} clinician-reviewed field(s).</p>
-        <div class="imgrid">
+      <div class="stats">
+        <div class="stat good"><div class="v">{{ s.correct }}</div><div class="k label">Correct</div></div>
+        <div class="stat bad"><div class="v">{{ s.incorrect }}</div><div class="k label">Incorrect</div></div>
+        <div class="stat"><div class="v">{{ s.reviewed }}</div><div class="k label">Fields reviewed</div></div>
+        <div class="stat"><div class="v">{{ '%.0f' % (s.accuracy*100) if s.accuracy is not none else '—' }}{{ '%' if s.accuracy is not none }}</div><div class="k label">Accuracy</div></div>
+      </div>
+      <table>
+        <thead><tr><th class="num">#</th><th>Note</th><th class="st">Review</th></tr></thead>
+        <tbody>
           {% for pi in s.per_image %}
-          <a class="imgcell" href="/eval/{{ run.id }}/{{ loop.index0 }}">
-            <div class="nm">{{ pi.image }}</div>
-            <div class="acc">{{ pi.correct }}/{{ pi.total }} correct · {{ '%.0f' % (pi.accuracy*100) }}%</div>
-          </a>
+          <tr onclick="location.href='/eval/{{ run.id }}/{{ loop.index0 }}'">
+            <td class="num">{{ '%02d' % (loop.index) }}</td>
+            <td class="file">{{ pi.image }}</td>
+            <td class="st">{% if pi.reviewed %}<span class="mark">{{ pi.correct }}/{{ pi.reviewed }} correct</span>{% else %}<span class="pending">— not reviewed</span>{% endif %}</td>
+          </tr>
           {% endfor %}
-        </div>
-        {% else %}
-        <p class="muted">Not judged yet.</p>
-        {% endif %}
-      </div>
-    </div>
+        </tbody>
+      </table>
+    </section>
     {% endfor %}
   </main>
 </body>

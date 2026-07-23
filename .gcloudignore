@@ -1,0 +1,13 @@
+# Keep the Cloud Build upload small. The review service's data (note images +
+# runs) is served from a mounted GCS bucket, not baked into the image.
+.git/
+.venv/
+__pycache__/
+*.py[cod]
+.cache/
+hf-cache/
+eval/
+.DS_Store
+.env
+.env.*
+scratchpad/

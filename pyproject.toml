@@ -18,6 +18,9 @@ dependencies = [
     # 4-bit quantization for the 27B on a 24GB L4 (QWEN_QUANT / JUDGE_QUANT). CUDA
     # only, so scope to Linux to keep macOS installs working.
     "bitsandbytes>=0.43; sys_platform == 'linux'",
+    # vLLM serving for the batch path (OCR_ENGINE=vllm). CUDA/Linux only; the
+    # StructuredOutputsParams API used in ocr.py needs v0.12+.
+    "vllm>=0.12; sys_platform == 'linux'",
     "pillow>=10.4",
     "pytesseract>=0.3.10",
     "huggingface-hub>=0.26",

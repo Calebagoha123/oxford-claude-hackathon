@@ -3,61 +3,99 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>Scan note</title>
+<title>De-paperfy — Scan lab report</title>
+<link rel="icon" type="image/png" href="/static/favicon.png">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@1,600&display=swap" rel="stylesheet">
 <style>
   * { box-sizing: border-box; }
   html, body { margin: 0; height: 100%; }
   body {
-    background: #0d1622; color: #e7edf5;
+    background: #1a120d; color: #f2ede7;
     font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     display: flex; flex-direction: column;
   }
-  .topbar { padding: .6rem 1rem; text-align: center; font-weight: 700; background: #0a1019; }
-  .topbar small { display: block; font-weight: 400; color: #9fb0c4; font-size: .8rem; }
+  .brand { display: flex; align-items: center; justify-content: center; gap: .45rem;
+    padding: .5rem 1rem .1rem; }
+  .brand img { width: 20px; height: 20px; }
+  .brand b { font-family: "Playfair Display", Georgia, serif; font-style: italic; font-weight: 600;
+    font-size: 16px; color: #f2ede7; }
+  .topbar { padding: .1rem 1rem .6rem; text-align: center; font-weight: 700; }
+  .topbar small { display: block; font-weight: 400; color: #b7a596; font-size: .8rem; }
 
   .stage {
     flex: 1; position: relative; overflow: hidden;
     display: flex; align-items: center; justify-content: center; background: #000;
   }
-  video, #shot {
-    width: 100%; height: 100%; object-fit: cover;
-  }
+  video, #shot { width: 100%; height: 100%; object-fit: cover; }
   #shot { display: none; }
+
+  /* framing guide — a centred rounded box that dims everything outside it and
+     changes colour with capture quality (red -> amber -> green). */
+  .frame {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    width: 90%; height: 72%; border-radius: 14px; pointer-events: none;
+    border: 3px solid rgba(255,255,255,.55);
+    box-shadow: 0 0 0 9999px rgba(0,0,0,.42);
+    transition: border-color .18s ease, box-shadow .18s ease;
+  }
+  .frame.bad   { border-color: #e8705a; }
+  .frame.near  { border-color: #e8b54a; }
+  .frame.good  { border-color: #57c785; box-shadow: 0 0 0 9999px rgba(0,0,0,.28), 0 0 22px rgba(87,199,133,.6); }
+
+  .hint {
+    position: absolute; left: 50%; bottom: 14px; transform: translateX(-50%);
+    display: flex; align-items: center; gap: .5rem; max-width: 92%;
+    padding: .4rem .8rem; border-radius: 999px; font-size: .85rem; font-weight: 600;
+    background: rgba(20,14,9,.78); color: #f2ede7; white-space: nowrap;
+  }
+  .hint .dot { width: 9px; height: 9px; border-radius: 50%; background: #e8705a; flex: none; }
+  .hint.near .dot { background: #e8b54a; }
+  .hint.good .dot { background: #57c785; }
+
+  .metrics {
+    position: absolute; left: 8px; top: 8px; font: 11px/1.4 ui-monospace, Menlo, monospace;
+    color: #cdbfae; background: rgba(0,0,0,.45); padding: .3rem .5rem; border-radius: 6px;
+    display: none; white-space: pre;
+  }
+  .metrics.show { display: block; }
 
   .controls {
     padding: 1rem; display: flex; align-items: center; justify-content: center; gap: 1.5rem;
-    background: #0a1019;
+    background: #0f0a07;
   }
   .shutter {
     width: 74px; height: 74px; border-radius: 50%; border: 5px solid #fff;
     background: #fff; cursor: pointer; flex-shrink: 0;
   }
   .shutter:active { transform: scale(.92); }
-  .txtbtn {
-    background: none; border: 0; color: #cfe0f2; font-size: 1rem; cursor: pointer;
-    padding: .6rem; font-weight: 600;
-  }
+  .shutter.armed { box-shadow: 0 0 0 4px rgba(87,199,133,.5); }
 
   #msg { text-align: center; padding: .6rem 1rem; min-height: 1.4rem; font-weight: 600; }
-  #msg.err { color: #f87171; }
-  #msg.ok { color: #4ade80; }
+  #msg.err { color: #f0a08c; }
+  #msg.ok { color: #8fd6a6; }
 
   .done {
-    position: absolute; inset: 0; background: #0d1622; display: none;
+    position: absolute; inset: 0; background: #1a120d; display: none;
     flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 2rem;
   }
   .done.show { display: flex; }
   .done .check { font-size: 4rem; }
   .done h2 { margin: .5rem 0 0; }
-  .done p { color: #9fb0c4; }
+  .done p { color: #b7a596; }
 </style>
 </head>
 <body>
-  <div class="topbar">Capture handwritten note<small>Frame the page, then tap the shutter</small></div>
+  <div class="brand"><img src="/static/depaperfy-icon.png" alt=""><b>De-paperfy</b></div>
+  <div class="topbar">Capture lab report<small>Fill the frame — it snaps automatically when clear</small></div>
 
   <div class="stage">
     <video id="video" autoplay muted playsinline></video>
     <canvas id="shot"></canvas>
+    <div class="frame" id="frame"></div>
+    <div class="hint" id="hint"><span class="dot"></span><span id="hint-text">Point at the report</span></div>
+    <div class="metrics" id="metrics"></div>
     <div class="done" id="done">
       <div class="check">✅</div>
       <h2>Sent</h2>
@@ -73,15 +111,122 @@
 
 <script>
 const sessionId = "{{ session_id }}";
+const DEBUG = new URLSearchParams(location.search).has('debug');
 const video = document.getElementById('video');
 const canvas = document.getElementById('shot');
 const shutter = document.getElementById('shutter');
 const msg = document.getElementById('msg');
 const done = document.getElementById('done');
 const controls = document.getElementById('controls');
-let stream = null;
+const frameEl = document.getElementById('frame');
+const hintEl = document.getElementById('hint');
+const hintText = document.getElementById('hint-text');
+const metricsEl = document.getElementById('metrics');
+let stream = null, capturing = false, autoGate = true;
+
+// --- quality-gate tunables (calibrate on-device with ?debug=1) ---
+const GW = 0.90, GH = 0.72;      // guide box as a fraction of the frame (matches CSS)
+const PW = 200, PH = 150;        // analysis canvas size (downscaled = cheap)
+const TICK_MS = 90;              // ~11 fps analysis
+const SHARP_MIN = 70;            // Laplacian variance floor (in focus)
+const BRIGHT_LO = 55, BRIGHT_HI = 225;
+const GLARE_MAX = 0.06;          // fraction of blown-out (>245) pixels
+const STEADY_MAX = 7;            // mean abs frame-to-frame diff (holding still)
+const STREAK_NEEDED = 5;         // consecutive good ticks (~0.5s) before auto-snap
+
+const proc = document.createElement('canvas');
+proc.width = PW; proc.height = PH;
+const pctx = proc.getContext('2d', { willReadFrequently: true });
+let prevGray = null, goodStreak = 0;
 
 function say(text, cls) { msg.className = cls || ''; msg.textContent = text; }
+
+function grayscale(data) {
+  const g = new Float32Array(PW * PH);
+  let sum = 0, glare = 0;
+  for (let i = 0, p = 0; i < data.length; i += 4, p++) {
+    const v = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    g[p] = v; sum += v;
+    if (v > 245) glare++;
+  }
+  return { g, brightness: sum / g.length, glare: glare / g.length };
+}
+
+function sharpness(g) {
+  // variance of the Laplacian — the standard "is it in focus" metric.
+  let sum = 0, sumSq = 0, n = 0;
+  for (let y = 1; y < PH - 1; y++) {
+    for (let x = 1; x < PW - 1; x++) {
+      const i = y * PW + x;
+      const lap = 4 * g[i] - g[i - 1] - g[i + 1] - g[i - PW] - g[i + PW];
+      sum += lap; sumSq += lap * lap; n++;
+    }
+  }
+  const mean = sum / n;
+  return sumSq / n - mean * mean;
+}
+
+function steadiness(g) {
+  if (!prevGray) return 999;
+  let diff = 0;
+  for (let i = 0; i < g.length; i++) diff += Math.abs(g[i] - prevGray[i]);
+  return diff / g.length;
+}
+
+function assess() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  if (!vw || !vh) return null;
+  // sample ONLY the guide region, so background scenery doesn't skew the metrics.
+  const sx = vw * (1 - GW) / 2, sy = vh * (1 - GH) / 2;
+  pctx.drawImage(video, sx, sy, vw * GW, vh * GH, 0, 0, PW, PH);
+  const { g, brightness, glare } = grayscale(pctx.getImageData(0, 0, PW, PH).data);
+  const sharp = sharpness(g);
+  const steady = steadiness(g);
+  prevGray = g;
+
+  let state = 'good', hint = 'Hold steady…';
+  if (brightness < BRIGHT_LO) { state = 'bad'; hint = 'Too dark — find more light'; }
+  else if (brightness > BRIGHT_HI) { state = 'bad'; hint = 'Too bright'; }
+  else if (glare > GLARE_MAX) { state = 'bad'; hint = 'Glare — tilt the page slightly'; }
+  else if (steady > STEADY_MAX) { state = 'near'; hint = 'Hold steady…'; }
+  else if (sharp < SHARP_MIN) { state = 'near'; hint = 'Move closer / let it focus'; }
+  else { state = 'good'; hint = 'Looks clear — hold it'; }
+  return { state, hint, brightness, glare, sharp, steady };
+}
+
+function paint(a) {
+  frameEl.className = 'frame ' + a.state;
+  hintEl.className = 'hint ' + a.state;
+  hintText.textContent = a.hint;
+  shutter.classList.toggle('armed', a.state === 'good');
+  if (DEBUG) {
+    metricsEl.classList.add('show');
+    metricsEl.textContent =
+      `sharp ${a.sharp.toFixed(0)} / ${SHARP_MIN}\n` +
+      `bright ${a.brightness.toFixed(0)} [${BRIGHT_LO}-${BRIGHT_HI}]\n` +
+      `glare ${(a.glare * 100).toFixed(1)}% / ${GLARE_MAX * 100}%\n` +
+      `steady ${a.steady.toFixed(1)} / ${STEADY_MAX}\n` +
+      `streak ${goodStreak}/${STREAK_NEEDED}`;
+  }
+}
+
+function tick() {
+  if (capturing || !stream) return;
+  try {
+    const a = assess();
+    if (a) {
+      paint(a);
+      if (autoGate && a.state === 'good') {
+        if (++goodStreak >= STREAK_NEEDED) { capture(); return; }
+      } else {
+        goodStreak = Math.max(0, goodStreak - 1);
+      }
+    }
+  } catch (e) {
+    autoGate = false;  // if frame analysis ever fails, fall back to manual shutter
+  }
+  setTimeout(tick, TICK_MS);
+}
 
 async function startCamera() {
   if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
@@ -96,6 +241,8 @@ async function startCamera() {
     video.srcObject = stream;
     await video.play();
     say('');
+    goodStreak = 0; prevGray = null;
+    tick();
   } catch (e) {
     say('Could not open camera: ' + (e.message || e.name) + '. Allow camera access and reload.', 'err');
   }
@@ -105,19 +252,22 @@ async function capture() {
   if (!stream) { startCamera(); return; }
   const w = video.videoWidth, h = video.videoHeight;
   if (!w || !h) { say('Camera still warming up — try again.', 'err'); return; }
+  capturing = true;  // stops the analysis loop
 
   // Freeze the current frame onto the canvas (no photo saved to the phone).
   canvas.width = w; canvas.height = h;
   canvas.getContext('2d').drawImage(video, 0, 0, w, h);
   video.style.display = 'none';
   canvas.style.display = 'block';
+  frameEl.style.display = 'none';
+  hintEl.style.display = 'none';
   shutter.disabled = true;
   say('Sending…');
 
   canvas.toBlob(async (blob) => {
     if (!blob) { say('Capture failed — try again.', 'err'); resetToLive(); return; }
     const body = new FormData();
-    body.append('image', blob, 'note.jpg');
+    body.append('image', blob, 'labreport.jpg');
     try {
       const r = await fetch('/api/scan/session/' + sessionId + '/upload', { method: 'POST', body });
       if (!r.ok) { const d = await r.json().catch(() => ({})); throw new Error(d.detail || 'upload failed'); }
@@ -136,10 +286,16 @@ async function capture() {
 function resetToLive() {
   canvas.style.display = 'none';
   video.style.display = 'block';
+  frameEl.style.display = '';
+  hintEl.style.display = '';
   shutter.disabled = false;
+  capturing = false;
+  goodStreak = 0; prevGray = null;
+  tick();
 }
 
-shutter.addEventListener('click', capture);
+// Manual shutter always works — override for the auto-gate (accessibility / odd lighting).
+shutter.addEventListener('click', () => { if (!capturing) capture(); });
 startCamera();
 </script>
 </body>

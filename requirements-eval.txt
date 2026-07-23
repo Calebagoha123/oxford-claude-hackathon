@@ -1,0 +1,5 @@
+# Minimal deps for the review-only Cloud Run service (serve_eval.py).
+# No torch / transformers — the review UI loads no model.
+fastapi
+uvicorn[standard]
+jinja2

@@ -41,7 +41,9 @@ from pathlib import Path
 os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
-EVAL_DIR = Path(__file__).parent / "eval"
+# Data root. Defaults to ./eval next to this file; set EVAL_DATA_DIR to point at
+# a mounted GCS bucket (e.g. /data) when serving the review UI on Cloud Run.
+EVAL_DIR = Path(os.environ.get("EVAL_DATA_DIR") or (Path(__file__).parent / "eval"))
 IMAGES_DIR = EVAL_DIR / "images"
 REFS_DIR = EVAL_DIR / "refs"
 RUNS_DIR = EVAL_DIR / "runs"

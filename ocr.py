@@ -18,10 +18,20 @@ Extraction backends (EXTRACT_PROVIDER) — text-only, they never see the image:
     note fields. This is what MedGemma is good at.
   - "claude": Claude via the Anthropic API; needs ANTHROPIC_API_KEY.
 
+Serving engine (OCR_ENGINE, local models only):
+  - "transformers" (default): HF generate(). Used everywhere, including the
+    latency-sensitive single-scan live path.
+  - "vllm": paged-attention + continuous batching for the BATCH path
+    (extract_batch, i.e. the eval pipeline). Stage 2 gets JSON-schema-constrained
+    decoding. One engine resident at a time (swapped between stages); see
+    vllm_engine.py. Not used for single-scan — rebuilding an engine per request
+    would cost more than it saves.
+
 Public functions:
   transcribe(image_bytes)          -> str             # stage 1 only
   extract_fields_from_text(text)   -> {note_key: value}  # stage 2 only
   extract(image_bytes)             -> {text, fields}  # both stages
+  extract_batch(image_list)        -> [{text, fields}]   # batch (vLLM-accelerated)
   warmup()                                            # preload the local models
 """
 
@@ -40,7 +50,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 from PIL import Image, ImageOps
 
-from data import NOTE_FIELDS
+from data import LAB_COLUMNS, LAB_FLAGS, LAB_META, NOTE_FIELDS
 
 # Two independently-swappable stages. OCR_PROVIDER is kept as a back-compat
 # shortcut: if set, it forces BOTH stages onto that provider (the old behaviour).
@@ -49,6 +59,19 @@ TRANSCRIBE_PROVIDER = (_LEGACY or os.getenv("TRANSCRIBE_PROVIDER", "qwen")).lowe
 EXTRACT_PROVIDER = (_LEGACY or os.getenv("EXTRACT_PROVIDER", "medgemma")).lower()
 # Legacy alias some callers still read (e.g. the /healthz endpoint).
 PROVIDER = EXTRACT_PROVIDER
+
+# Local-inference engine: "transformers" (default) or "vllm". vLLM only kicks in
+# on the BATCH path (extract_batch, i.e. the eval pipeline) where its continuous
+# batching + paged attention pay off and the one-engine-at-a-time model swap is
+# amortized over many images. The single-scan live path stays on transformers —
+# rebuilding a vLLM engine per request would dwarf the inference it saves. Only
+# the default local combo (qwen -> medgemma) is vLLM-accelerated; other provider
+# mixes fall through to transformers.
+OCR_ENGINE = os.getenv("OCR_ENGINE", "transformers").lower()
+# vLLM engine-build knobs (per model, shared defaults). max_model_len bounds the
+# KV cache; keep it just above vision-tokens + generated tokens for headroom.
+_VLLM_GPU_UTIL = float(os.getenv("VLLM_GPU_UTIL", "0.90"))
+_VLLM_MAX_MODEL_LEN = int(os.getenv("VLLM_MAX_MODEL_LEN", "8192"))
 # Upper bound on generated tokens. generate() requires *a* cap (without one,
 # transformers falls back to max_length=20). It's a ceiling, not a target —
 # the model stops at EOS when the JSON is done, so a high value is ~free.
@@ -110,6 +133,20 @@ ORIENT = os.getenv("ORIENT", "1") == "1"
 # OSD is trained on printed text and gets shaky on pure handwriting; ignore a
 # rotation call unless its confidence clears this bar.
 ORIENT_MIN_CONF = float(os.getenv("ORIENT_MIN_CONF", "2.0"))
+# OSD (the tesseract call) is the expensive, unreliable half of orientation.
+# Phone cameras almost always stamp a real orientation into EXIF, which is
+# accurate — so when that's present we skip OSD entirely. Only fall back to OSD
+# when EXIF is absent/normal (a note laid down sideways on a flatbed, or a
+# stripped JPEG). Set OSD_SKIP_IF_EXIF=0 to always run OSD.
+OSD_SKIP_IF_EXIF = os.getenv("OSD_SKIP_IF_EXIF", "1") == "1"
+
+
+def _exif_orientation(img: Image.Image) -> int:
+    """The image's EXIF orientation tag (1 = normal/none; 3/6/8 = 180/270/90)."""
+    try:
+        return int(img.getexif().get(0x0112, 1))
+    except Exception:  # noqa: BLE001 - no/broken EXIF
+        return 1
 
 
 def _orient_upright(img: Image.Image) -> Image.Image:
@@ -117,7 +154,12 @@ def _orient_upright(img: Image.Image) -> Image.Image:
         return img
     # 1) Honor the camera's own EXIF orientation (reliable; matters for phone
     #    captures in the live app — sips already baked it into the eval JPGs).
+    had_exif_rotation = _exif_orientation(img) in (3, 6, 8)
     img = ImageOps.exif_transpose(img)
+    # If EXIF already carried a real rotation, it's stood the text up correctly —
+    # skip the slow, handwriting-shaky OSD pass entirely.
+    if OSD_SKIP_IF_EXIF and had_exif_rotation:
+        return img
     # 2) Then use OSD for paper-relative rotation (note laid down sideways).
     #    Detect on a downscaled probe — orientation doesn't need 12MP, and
     #    full-res OSD is several seconds per image.
@@ -513,12 +555,262 @@ def _assemble_fields(raw: str) -> dict:
         return _salvage_fields(raw)
 
 
+# ---------------------------------------------------------------- lab reports
+# The demo's live path. Same two-stage split as notes — stage 1 transcribes the
+# image (Qwen), stage 2 routes the clean text into structured fields (MedGemma) —
+# but a lab report is a HEADER + a TABLE, so stage 2 emits {meta, results:[...]}
+# instead of a flat field dict. transcribe() is shared verbatim; only the stage-2
+# prompt/parse differ, so the note eval pipeline is completely untouched.
+_LAB_META_KEYS = [k for k, _label in LAB_META]
+_LAB_ROW_KEYS = [k for k, _label in LAB_COLUMNS]
+
+_LAB_EXTRACT_HEAD = (
+    "Below is the full transcript of a laboratory test report. Return ONLY a JSON "
+    "object — no thinking, no explanation, no markdown fences, nothing but the JSON. "
+    "Use exactly this shape:\n"
+    "{\n"
+    '  "meta": {' + ", ".join(f'"{k}": ""' for k in _LAB_META_KEYS) + "},\n"
+    '  "results": [\n'
+    '    {"test": "", "value": "", "unit": "", "reference_range": "", "flag": ""}\n'
+    "  ]\n"
+    "}\n"
+    "STRICT RULES — accuracy matters far more than completeness:\n"
+    '- Add one object to "results" for EVERY analyte/measurement actually present in '
+    "the report. Copy the test name, value, unit and reference range exactly as written.\n"
+    '- "value" is the measured result as written — a number like "13.2", or a word like '
+    '"Positive"/"Not detected".\n'
+    '- Leave any field "" when the report does not state it. Do NOT guess, infer, or '
+    "invent tests, values, units or ranges. An empty field is better than a wrong one.\n"
+    '- "flag": use "high", "low", "critical" or "abnormal" ONLY when the report itself '
+    "marks the result that way (an H / L / * / HIGH / LOW / CRIT flag beside the value, or "
+    'a value plainly outside the stated reference range). Otherwise "".\n'
+    '- Fill "meta" from the report header only; leave any unknown header field "".\n'
+    "Your entire response must start with { and end with }.\n"
+)
+
+
+def _extract_labs_prompt(transcript: str) -> str:
+    return (
+        f"{_LAB_EXTRACT_HEAD}\n"
+        "=== TRANSCRIPT ===\n"
+        f"{transcript.strip()}\n"
+        "=== END TRANSCRIPT ==="
+    )
+
+
+def _norm_flag(v) -> str:
+    """Fold the model's flag onto our vocabulary (LAB_FLAGS); normal/unknown -> ""."""
+    s = str(v or "").strip().lower()
+    if s in LAB_FLAGS:
+        return s
+    return {
+        "h": "high", "hi": "high",
+        "l": "low", "lo": "low",
+        "crit": "critical", "panic": "critical", "critical high": "critical",
+        "critical low": "critical", "*": "critical",
+        "a": "abnormal", "abn": "abnormal", "pos": "abnormal", "positive": "abnormal",
+    }.get(s, "")
+
+
+def _norm_row(row: dict) -> dict:
+    r = {k: _flat(row.get(k)) for k in _LAB_ROW_KEYS}
+    r["flag"] = _norm_flag(row.get("flag"))
+    return r
+
+
+def _assemble_labs(raw: str) -> dict:
+    """Turn one stage-2 response into {meta, results}, salvaging broken JSON as best
+    we can (a truncated results array still yields the rows that parsed)."""
+    try:
+        data = _parse_json(raw)
+    except Exception:  # noqa: BLE001 - malformed/truncated JSON
+        data = _salvage_labs(raw)
+    meta_in = data.get("meta") if isinstance(data.get("meta"), dict) else {}
+    meta = {k: _flat(meta_in.get(k)) for k in _LAB_META_KEYS}
+    rows_in = data.get("results") if isinstance(data.get("results"), list) else []
+    results = [_norm_row(r) for r in rows_in if isinstance(r, dict)]
+    # Drop fully-empty rows (a stray {} the model sometimes appends).
+    results = [r for r in results if any(r[k] for k in _LAB_ROW_KEYS)]
+    return {"meta": meta, "results": results}
+
+
+def _salvage_labs(raw: str) -> dict:
+    """Best-effort recovery when the whole object won't parse: pull the meta values
+    by key, and parse whatever result objects are individually well-formed."""
+    meta = {k: _regex_value(raw, k) for k in _LAB_META_KEYS}
+    results = []
+    # Each result object spans "test" .. the next "}" — parse them one at a time so
+    # a single broken row doesn't lose the rest.
+    for m in re.finditer(r"\{[^{}]*\"test\"[^{}]*\}", raw, re.DOTALL):
+        try:
+            results.append(json.loads(m.group(0)))
+        except Exception:  # noqa: BLE001 - skip an unparseable row
+            pass
+    return {"meta": meta, "results": results}
+
+
+def _claude_labs_from_text(transcript: str) -> str:
+    """Stage-2 Claude for labs: {meta, results} JSON from a text transcript."""
+    client, model = _claude_client()
+    row_schema = {
+        "type": "object",
+        "properties": {k: {"type": "string"} for k in _LAB_ROW_KEYS},
+        "required": list(_LAB_ROW_KEYS),
+        "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "meta": {
+                "type": "object",
+                "properties": {k: {"type": "string"} for k in _LAB_META_KEYS},
+                "required": list(_LAB_META_KEYS),
+                "additionalProperties": False,
+            },
+            "results": {"type": "array", "items": row_schema},
+        },
+        "required": ["meta", "results"],
+        "additionalProperties": False,
+    }
+    resp = client.messages.create(
+        model=model,
+        max_tokens=4000,
+        messages=[{"role": "user", "content": [
+            {"type": "text", "text": _extract_labs_prompt(transcript)}]}],
+        output_config={"format": {"type": "json_schema", "schema": schema}},
+    )
+    return "".join(b.text for b in resp.content if b.type == "text").strip()
+
+
+def extract_labs_from_text(transcript: str) -> dict:
+    """Stage 2 for labs: transcript text -> {meta, results}. Text-only; no image."""
+    if not transcript.strip():
+        return {"meta": {k: "" for k in _LAB_META_KEYS}, "results": []}
+    if EXTRACT_PROVIDER == "claude":
+        raw = _claude_labs_from_text(transcript)
+    else:
+        raw = _medgemma_text_run(
+            _extract_labs_prompt(transcript), prefill=EXTRACT_PREFILL, **EXTRACT_GEN)
+    return _assemble_labs(raw)
+
+
+def extract_labs(image_bytes: bytes) -> dict:
+    """Both stages for a lab report: image -> {text, meta, results}.
+
+    Stage 1 transcribes the report (Qwen by default); stage 2 routes that clean
+    transcript into a header + a table of analyte rows (MedGemma by default).
+    Structured output that can't be parsed degrades to empty results, so the UI
+    can still show the transcription.
+    """
+    transcript = transcribe(image_bytes)
+    out = extract_labs_from_text(transcript)
+    return {"text": transcript, "meta": out["meta"], "results": out["results"]}
+
+
+# ---------------------------------------------------------------- vLLM (local, batch)
+# Prompt strings for vLLM are built with the HF processor (cheap: tokenizer +
+# image-processor config, no model weights) and handed to the engine as
+# {"prompt": str, "multi_modal_data": {"image": pil}}. The model itself is served
+# by vllm_engine, which keeps one engine resident and swaps on model change.
+_qwen_proc_only = None
+_mg_proc_only = None
+
+
+def _proc_only(model_id: str, cache_attr: str):
+    from transformers import AutoProcessor
+
+    globals()[cache_attr] = globals().get(cache_attr) or AutoProcessor.from_pretrained(model_id)
+    return globals()[cache_attr]
+
+
+def _qwen_transcribe_batch_vllm(image_list: list[bytes]) -> list[str]:
+    """Stage 1 over a batch on vLLM: one engine, continuous-batched generation."""
+    import vllm_engine
+    from vllm import SamplingParams
+
+    proc = _proc_only(_QWEN_ID, "_qwen_proc_only")
+    build: dict = {
+        "gpu_memory_utilization": _VLLM_GPU_UTIL,
+        "max_model_len": _VLLM_MAX_MODEL_LEN,
+        "limit_mm_per_prompt": {"image": 1},
+        "dtype": "bfloat16",
+    }
+    if _QWEN_QUANT:
+        build["quantization"] = "bitsandbytes"
+    llm = vllm_engine.get(_QWEN_ID, **build)
+    # enable_thinking=False injected into the template, same as the transformers
+    # path — Qwen3.6 otherwise spends the whole budget "thinking" and never
+    # reaches the transcript. repetition_penalty is a light nudge (verbatim OCR).
+    sp = SamplingParams(temperature=0.0, max_tokens=_QWEN_MAX_NEW_TOKENS,
+                        repetition_penalty=QWEN_TRANSCRIBE_GEN["repetition_penalty"])
+    reqs = []
+    for b in image_list:
+        msgs = [{"role": "user", "content": [
+            {"type": "image"}, {"type": "text", "text": TRANSCRIBE_PROMPT}]}]
+        prompt = proc.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False, enable_thinking=False)
+        reqs.append({"prompt": prompt, "multi_modal_data": {"image": _qwen_image(b)}})
+    outs = llm.generate(reqs, sp)
+    texts = []
+    for o in outs:
+        t = o.outputs[0].text.strip()
+        if "</think>" in t:  # defensive, mirrors _qwen_transcribe
+            t = t.rsplit("</think>", 1)[-1].strip()
+        texts.append(t)
+    return texts
+
+
+def _medgemma_fields_batch_vllm(transcripts: list[str]) -> list[dict]:
+    """Stage 2 over a batch on vLLM, with JSON-schema-constrained decoding. The
+    schema guarantees valid JSON matching our keys, so the prefill hack, the high
+    token ceiling's runaway risk, and the regex-salvage path all fall away."""
+    import vllm_engine
+    from vllm import SamplingParams
+    from vllm.sampling_params import StructuredOutputsParams
+
+    proc = _proc_only(_MODEL_ID, "_mg_proc_only")
+    # get() frees the Qwen engine and builds MedGemma — the two never co-reside.
+    llm = vllm_engine.get(_MODEL_ID, gpu_memory_utilization=_VLLM_GPU_UTIL,
+                          max_model_len=_VLLM_MAX_MODEL_LEN, dtype="bfloat16")
+    schema = {
+        "type": "object",
+        "properties": {k: {"type": "string"} for k in _FIELD_KEYS},
+        "required": list(_FIELD_KEYS),
+        "additionalProperties": False,
+    }
+    sp = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
+                        repetition_penalty=EXTRACT_GEN["repetition_penalty"],
+                        structured_outputs=StructuredOutputsParams(json=schema))
+    # Skip empty transcripts (nothing to route) but keep positions aligned.
+    idx = [i for i, t in enumerate(transcripts) if t.strip()]
+    prompts = []
+    for i in idx:
+        msgs = [{"role": "user", "content": [
+            {"type": "text", "text": _extract_from_text_prompt(transcripts[i])}]}]
+        prompts.append(proc.apply_chat_template(
+            msgs, add_generation_prompt=True, tokenize=False))
+    outs = llm.generate(prompts, sp) if prompts else []
+    results = [{k: "" for k in _FIELD_KEYS} for _ in transcripts]
+    for i, o in zip(idx, outs):
+        results[i] = _assemble_fields(o.outputs[0].text)
+    return results
+
+
 def extract_batch(image_list: list[bytes]) -> list[dict]:
     """extract() over several images, in two passes: transcribe ALL of them, free
     the vision model, then extract fields for ALL of them. This keeps the two
     models from co-residing on a single 24GB card (which OOMs) and is why the batch
-    path exists separately from per-image extract(). Per-image within each stage —
-    batched generation isn't worth the padding complexity on this hardware."""
+    path exists separately from per-image extract().
+
+    With OCR_ENGINE=vllm (and the default qwen->medgemma combo) each pass is a
+    single continuous-batched vLLM call and stage 2 uses JSON-schema-constrained
+    decoding; otherwise it's the transformers path (per-image within each stage —
+    batched generation there isn't worth the padding complexity on this hardware).
+    """
+    if OCR_ENGINE == "vllm" and TRANSCRIBE_PROVIDER == "qwen" and EXTRACT_PROVIDER == "medgemma":
+        transcripts = _qwen_transcribe_batch_vllm(image_list)
+        fields = _medgemma_fields_batch_vllm(transcripts)  # swaps engine, frees Qwen
+        return [{"text": t, "fields": f} for t, f in zip(transcripts, fields)]
     transcripts = [transcribe(b) for b in image_list]
     if TRANSCRIBE_PROVIDER == "qwen" and EXTRACT_PROVIDER == "medgemma":
         _free_qwen()  # release ~16GB before MedGemma loads

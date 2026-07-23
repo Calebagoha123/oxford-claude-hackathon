@@ -1,32 +1,17 @@
-# syntax=docker/dockerfile:1
-#
-# MediSnap EHR — for deploying the local MedGemma OCR path on a LINUX host with a
-# CUDA GPU. Docker on macOS cannot access the Mac GPU — run locally with `uv run`
-# there instead. (For the Claude OCR path you don't need the GPU image at all.)
-#
-# Build:  docker build -t medisnap .
-# Run:    docker run --rm --gpus all -p 8000:8000 -e HF_TOKEN=hf_... medisnap
-FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
-
-# uv binary
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
-
-# Python (uv will install the right version into the venv)
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
-    rm -rf /var/lib/apt/lists/*
+# Review-only service for Cloud Run. CPU-only, no model — see serve_eval.py.
+FROM python:3.12-slim
 
 WORKDIR /app
 
-COPY pyproject.toml uv.lock* ./
-RUN uv sync --no-install-project --no-dev
+COPY requirements-eval.txt .
+RUN pip install --no-cache-dir -r requirements-eval.txt
 
-COPY app.py data.py ocr.py ./
-COPY templates ./templates
+# Only the files the review UI needs. Note images + runs live in the mounted
+# GCS bucket ($EVAL_DATA_DIR), not in the image, so this stays small.
+COPY serve_eval.py eval_ui.py eval_pipeline.py data.py ./
+COPY templates/ templates/
+COPY static/ static/
 
-ENV PATH="/app/.venv/bin:$PATH"
-# Cache model weights on a mounted volume so they survive container restarts:
-#   docker run ... -v hf-cache:/root/.cache/huggingface ...
-ENV HF_HOME=/root/.cache/huggingface
-EXPOSE 8000
-
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+ENV PORT=8080
+# Shell form so $PORT is expanded at runtime (Cloud Run injects it).
+CMD exec uvicorn serve_eval:app --host 0.0.0.0 --port $PORT
