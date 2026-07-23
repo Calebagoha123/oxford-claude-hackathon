@@ -187,6 +187,11 @@ def _pil(image_bytes: bytes) -> Image.Image:
 
 # ---------------------------------------------------------------- MedGemma (local)
 _MODEL_ID = "google/medgemma-1.5-4b-it"
+# 4-bit the router (MEDGEMMA_QUANT=1) so it co-resides with a *bf16* Qwen on a 24GB
+# L4: MedGemma-4b is ~3GB in nf4 vs ~8GB in bf16, which is the difference between
+# both models fitting resident (fast, no per-scan model reload) and OOM. Stage 2 is
+# a text-routing task, so 4-bit costs little accuracy. Default off (bf16).
+_MEDGEMMA_QUANT = os.getenv("MEDGEMMA_QUANT", "0") == "1"
 _model = None
 _proc = None
 _device = None
@@ -204,15 +209,30 @@ def _load_model():
                 import torch
                 from transformers import AutoModelForImageTextToText, AutoProcessor
 
+                kwargs: dict = {}
                 if torch.cuda.is_available():
-                    _device, dtype = "cuda", torch.bfloat16
+                    _device = "cuda"
+                    if _MEDGEMMA_QUANT:
+                        from transformers import BitsAndBytesConfig
+
+                        kwargs["quantization_config"] = BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_quant_type="nf4",
+                            bnb_4bit_compute_dtype=torch.bfloat16,
+                        )
+                        kwargs["device_map"] = "auto"
+                    else:
+                        kwargs["dtype"] = torch.bfloat16
+                        kwargs["device_map"] = _device
                 elif torch.backends.mps.is_available():
-                    _device, dtype = "mps", torch.float16
+                    _device = "mps"
+                    kwargs["dtype"], kwargs["device_map"] = torch.float16, "mps"
                 else:
-                    _device, dtype = "cpu", torch.float32
+                    _device = "cpu"
+                    kwargs["dtype"] = torch.float32
                 _proc = AutoProcessor.from_pretrained(_MODEL_ID)
                 _model = AutoModelForImageTextToText.from_pretrained(
-                    _MODEL_ID, dtype=dtype, device_map=_device).eval()
+                    _MODEL_ID, **kwargs).eval()
     return _model, _proc
 
 
@@ -536,6 +556,13 @@ def extract(image_bytes: bytes) -> dict:
     degrades to empty fields, so the UI can still show the transcription.
     """
     transcript = transcribe(image_bytes)
+    # Fallback residency lever: a bf16 Qwen (~16GB) + bf16 MedGemma (~8GB) don't
+    # co-reside on a 24GB L4. Preferred fix is MEDGEMMA_QUANT=1 (both resident,
+    # ~19GB, no reload). If MedGemma must stay bf16, set FREE_QWEN_AFTER_TRANSCRIBE=1
+    # to release the vision model before the router loads — sequential residency at
+    # the cost of reloading Qwen on the next scan.
+    if os.getenv("FREE_QWEN_AFTER_TRANSCRIBE") == "1":
+        _free_qwen()
     return {"text": transcript, "fields": extract_fields_from_text(transcript)}
 
 
