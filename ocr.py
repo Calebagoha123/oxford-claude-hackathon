@@ -497,6 +497,16 @@ def warmup():
     try:
         import torch
 
+        if OCR_ENGINE == "vllm" and EXTRACT_PROVIDER == "medgemma":
+            # Build the resident MedGemma vLLM engine now so the first live scan
+            # isn't a cold engine build (~2-3 min). The single-pass lab path reuses
+            # it. (vLLM owns the card, so we skip the transformers preload below.)
+            import vllm_engine
+
+            vllm_engine.get(_MODEL_ID, gpu_memory_utilization=_VLLM_GPU_UTIL,
+                            max_model_len=_VLLM_MAX_MODEL_LEN, dtype="bfloat16",
+                            limit_mm_per_prompt={"image": 1})
+            return
         if TRANSCRIBE_PROVIDER == "qwen":
             model, proc = _load_qwen()
             inputs = proc.apply_chat_template(
@@ -745,14 +755,58 @@ def extract_labs_from_text(transcript: str) -> dict:
     return _assemble_labs(raw)
 
 
+def _medgemma_labs_image_vllm(image_bytes: bytes) -> dict:
+    """Single-pass lab extraction on a *resident* vLLM MedGemma engine: image ->
+    {meta, results} with JSON-schema-constrained decoding. Unlike the batch helpers
+    (which swap engines per pass), this keeps one MedGemma engine alive across scans
+    — both single-pass calls use the same model, so there's no per-request rebuild
+    and vLLM's faster decode lands on the live single-scan path. The schema forces
+    valid JSON with all keys present, so no prefill/salvage needed."""
+    import vllm_engine
+    from vllm import SamplingParams
+    from vllm.sampling_params import StructuredOutputsParams
+
+    proc = _proc_only(_MODEL_ID, "_mg_proc_only")
+    llm = vllm_engine.get(_MODEL_ID, gpu_memory_utilization=_VLLM_GPU_UTIL,
+                          max_model_len=_VLLM_MAX_MODEL_LEN, dtype="bfloat16",
+                          limit_mm_per_prompt={"image": 1})
+    row_schema = {
+        "type": "object",
+        "properties": {k: {"type": "string"} for k in _LAB_ROW_KEYS},
+        "required": list(_LAB_ROW_KEYS), "additionalProperties": False,
+    }
+    schema = {
+        "type": "object",
+        "properties": {
+            "meta": {"type": "object",
+                     "properties": {k: {"type": "string"} for k in _LAB_META_KEYS},
+                     "required": list(_LAB_META_KEYS), "additionalProperties": False},
+            "results": {"type": "array", "items": row_schema},
+        },
+        "required": ["meta", "results"], "additionalProperties": False,
+    }
+    sp = SamplingParams(temperature=0.0, max_tokens=MAX_NEW_TOKENS,
+                        structured_outputs=StructuredOutputsParams(json=schema))
+    msgs = [{"role": "user", "content": [
+        {"type": "image"}, {"type": "text", "text": _LAB_EXTRACT_IMAGE_HEAD}]}]
+    prompt = proc.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False)
+    outs = llm.generate(
+        [{"prompt": prompt, "multi_modal_data": {"image": _pil(image_bytes)}}], sp)
+    return _assemble_labs(outs[0].outputs[0].text)
+
+
 def extract_labs_single_pass(image_bytes: bytes) -> dict:
     """One MedGemma pass: image -> {meta, results} directly, skipping the verbatim
     transcript. Roughly halves generated tokens vs transcribe+route, so it's much
     faster; the trade is no transcript for the side-by-side (the source photo is
-    still shown). Best on clean printed reports."""
-    raw = _medgemma_run(
-        image_bytes, _LAB_EXTRACT_IMAGE_HEAD, prefill=EXTRACT_PREFILL, **EXTRACT_GEN)
-    out = _assemble_labs(raw)
+    still shown). Best on clean printed reports. With OCR_ENGINE=vllm this runs on a
+    resident vLLM engine (faster decode); otherwise on transformers."""
+    if OCR_ENGINE == "vllm":
+        out = _medgemma_labs_image_vllm(image_bytes)
+    else:
+        raw = _medgemma_run(
+            image_bytes, _LAB_EXTRACT_IMAGE_HEAD, prefill=EXTRACT_PREFILL, **EXTRACT_GEN)
+        out = _assemble_labs(raw)
     return {"text": "", "meta": out["meta"], "results": out["results"]}
 
 
