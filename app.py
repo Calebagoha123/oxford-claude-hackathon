@@ -36,6 +36,8 @@ import labs
 import ocr
 import patients
 from data import NOTE_FIELDS, PATIENT
+from integrations.openmrs import OpenMRSClient, OpenMRSError, publish_record
+from integrations.openmrs.bootstrap import bootstrap as bootstrap_openmrs
 
 
 @asynccontextmanager
@@ -95,6 +97,10 @@ def _qr_data_uri(url: str) -> str:
 # ----------------------------------------------------------------- pages
 @app.get("/")
 async def index():
+    if os.getenv("EHR_MODE", "mock").lower() == "openmrs":
+        return RedirectResponse(
+            os.getenv("OPENMRS_PUBLIC_URL", "http://localhost:8080/openmrs").rstrip("/") + "/spa"
+        )
     return RedirectResponse("/facesheet")
 
 
@@ -154,6 +160,7 @@ async def create_scan_session(request: Request):
         body = {}
     mode = body.get("mode") if body.get("mode") in _MODES else "single"
     doc_type = body.get("doc_type") if body.get("doc_type") in _DOC_TYPES else "note"
+    patient_uuid = str(body.get("openmrs_patient_uuid") or "").strip() or None
 
     _prune_sessions()
     session_id = uuid.uuid4().hex[:10]
@@ -161,11 +168,13 @@ async def create_scan_session(request: Request):
         _sessions[session_id] = {
             "status": "waiting", "mode": mode, "doc_type": doc_type, "error": None,
             "created": time.time(),
+            "openmrs_patient_uuid": patient_uuid,
             "records": None,  # filled on done: list of {doc_type, ...}
         }
     mobile_url = f"{_base_url()}/m/{session_id}"
     return {
         "id": session_id, "mode": mode, "doc_type": doc_type,
+        "openmrs_patient_uuid": patient_uuid,
         "mobile_url": mobile_url, "qr": _qr_data_uri(mobile_url),
     }
 
@@ -233,6 +242,74 @@ async def upload_photo(
     return JSONResponse({"ok": True, "count": len(items)})
 
 
+def _openmrs_client() -> OpenMRSClient:
+    """Factory kept separate so tests and deployments can replace the adapter."""
+    return OpenMRSClient()
+
+
+@app.get("/api/openmrs/patients")
+async def openmrs_patients(q: str = ""):
+    if not q.strip():
+        raise HTTPException(status_code=400, detail="A patient search term is required.")
+    client = _openmrs_client()
+    try:
+        return {"results": client.search_patients(q.strip())}
+    except OpenMRSError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        client.close()
+
+
+@app.post("/api/openmrs/bootstrap")
+async def openmrs_bootstrap():
+    """Create the two synthetic demo patients, safely repeatable."""
+    client = _openmrs_client()
+    try:
+        seeded = bootstrap_openmrs(client)
+        return {"patients": [{"uuid": p["uuid"], "display": p.get("display", "")} for p in seeded]}
+    except OpenMRSError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        client.close()
+
+
+@app.post("/api/scan/session/{session_id}/approve")
+async def approve_scan(session_id: str, request: Request):
+    """Publish one reviewed scan record to the explicitly selected patient."""
+    sess = _sessions.get(session_id)
+    if sess is None:
+        raise HTTPException(status_code=404, detail="Unknown or expired scan session.")
+    if sess.get("status") != "done" or not sess.get("records"):
+        raise HTTPException(status_code=409, detail="The scan is not ready for approval.")
+    try:
+        body = await request.json()
+    except Exception:  # noqa: BLE001
+        body = {}
+    patient_uuid = str(body.get("openmrs_patient_uuid") or sess.get("openmrs_patient_uuid") or "").strip()
+    if not patient_uuid:
+        raise HTTPException(status_code=400, detail="An OpenMRS patient UUID is required.")
+    record_index = body.get("record_index", 0)
+    if not isinstance(record_index, int) or not 0 <= record_index < len(sess["records"]):
+        raise HTTPException(status_code=400, detail="Invalid record_index.")
+    record = sess["records"][record_index]
+    if record.get("openmrs", {}).get("encounter_uuid"):
+        raise HTTPException(status_code=409, detail="This record was already published.")
+
+    client = _openmrs_client()
+    try:
+        result = publish_record(client, patient_uuid, record)
+        with _sessions_lock:
+            record["openmrs"] = result
+        return result
+    except OpenMRSError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    finally:
+        client.close()
+
+
 @app.get("/healthz")
 async def healthz():
-    return {"status": "ok", "ocr_provider": ocr.PROVIDER, "base_url": _base_url()}
+    return {
+        "status": "ok", "ocr_provider": ocr.PROVIDER, "base_url": _base_url(),
+        "openmrs_base_url": os.getenv("OPENMRS_BASE_URL", "http://localhost:8080/openmrs"),
+    }

@@ -545,6 +545,74 @@ def _claude_note_from_text(transcript: str) -> str:
     return "".join(b.text for b in resp.content if b.type == "text").strip()
 
 
+# ---------------------------------------------------------------- Ollama / GGUF (local CPU)
+_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://127.0.0.1:11434").rstrip("/")
+_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen3-vl:4b-instruct")
+_OLLAMA_TIMEOUT = float(os.getenv("OLLAMA_TIMEOUT", "1800"))
+
+
+def _object_schema(properties: dict, required: list[str]) -> dict:
+    return {
+        "type": "object", "properties": properties, "required": required,
+        "additionalProperties": False,
+    }
+
+
+def _note_schema(include_patient: bool = True) -> dict:
+    props = {k: {"type": "string"} for k in _FIELD_KEYS}
+    required = list(_FIELD_KEYS)
+    if include_patient:
+        props["patient"] = _object_schema(
+            {k: {"type": "string"} for k in DEMOGRAPHIC_KEYS},
+            list(DEMOGRAPHIC_KEYS),
+        )
+        required = ["patient", *required]
+    return _object_schema(props, required)
+
+
+def _lab_schema() -> dict:
+    # Lab layouts vary, so row keys remain open while the stable envelope is
+    # constrained. normalize_report() handles whichever columns are returned.
+    patient_keys = ("name", "mrn", "dob", "sex", "age")
+    patient = _object_schema(
+        {k: {"type": "string"} for k in patient_keys}, list(patient_keys))
+    panel = _object_schema({
+        "name": {"type": "string"},
+        "rows": {"type": "array", "items": {"type": "object"}},
+    }, ["name", "rows"])
+    return _object_schema({
+        "report_title": {"type": "string"},
+        "report_date": {"type": "string"},
+        "patient": patient,
+        "panels": {"type": "array", "items": panel},
+    }, ["report_title", "report_date", "patient", "panels"])
+
+
+def _ollama_chat(prompt: str, image_bytes: bytes | None = None,
+                 schema: dict | None = None) -> str:
+    """Run the local quantized model through Ollama's HTTP API."""
+    import httpx
+
+    message: dict = {"role": "user", "content": prompt}
+    if image_bytes is not None:
+        buf = io.BytesIO()
+        _pil(image_bytes).save(buf, format="JPEG", quality=92)
+        message["images"] = [base64.b64encode(buf.getvalue()).decode("ascii")]
+    payload: dict = {
+        "model": _OLLAMA_MODEL,
+        "messages": [message],
+        "stream": False,
+        "keep_alive": "10m",
+        "options": {"temperature": 0, "num_ctx": 8192, "num_predict": 2048},
+    }
+    if schema is not None:
+        payload["format"] = schema
+    response = httpx.post(f"{_OLLAMA_URL}/api/chat", json=payload,
+                          timeout=_OLLAMA_TIMEOUT)
+    response.raise_for_status()
+    return response.json()["message"]["content"].strip()
+
+
 # ---------------------------------------------------------------- public API
 def _parse_json(text: str) -> dict:
     t = text.strip()
@@ -616,6 +684,9 @@ def warmup():
     so CUDA kernels are compiled at startup — the first real scan is then fast, not
     cold. Best-effort; API-backed stages are no-ops."""
     try:
+        if TRANSCRIBE_PROVIDER == "ollama" or EXTRACT_PROVIDER == "ollama":
+            _ollama_chat("Reply with only: ok")
+            return
         import torch
 
         if TRANSCRIBE_PROVIDER == "qwen":
@@ -652,6 +723,8 @@ def transcribe(image_bytes: bytes) -> str:
     """Stage 1: image -> verbatim transcript."""
     if TRANSCRIBE_PROVIDER == "claude":
         return _claude_run(image_bytes, TRANSCRIBE_PROMPT)
+    if TRANSCRIBE_PROVIDER == "ollama":
+        return _ollama_chat(TRANSCRIBE_PROMPT, image_bytes=image_bytes)
     if TRANSCRIBE_PROVIDER == "medgemma":
         return _medgemma_run(image_bytes, TRANSCRIBE_PROMPT, **TRANSCRIBE_GEN)
     return _qwen_transcribe(image_bytes)
@@ -663,6 +736,9 @@ def extract_fields_from_text(transcript: str) -> dict:
         return {k: "" for k in _FIELD_KEYS}
     if EXTRACT_PROVIDER == "claude":
         raw = _claude_fields_from_text(transcript)
+    elif EXTRACT_PROVIDER == "ollama":
+        raw = _ollama_chat(_extract_from_text_prompt(transcript),
+                           schema=_note_schema(include_patient=False))
     else:
         raw = _medgemma_text_run(
             _extract_from_text_prompt(transcript), prefill=EXTRACT_PREFILL, **EXTRACT_GEN)
@@ -674,6 +750,8 @@ def _stage2_note_raw(transcript: str) -> str:
     identifiers + note fields."""
     if EXTRACT_PROVIDER == "claude":
         return _claude_note_from_text(transcript)
+    if EXTRACT_PROVIDER == "ollama":
+        return _ollama_chat(_note_from_text_prompt(transcript), schema=_note_schema())
     return _medgemma_text_run(
         _note_from_text_prompt(transcript), prefill=EXTRACT_PREFILL, **EXTRACT_GEN)
 
@@ -708,6 +786,8 @@ def extract_labs(image_bytes: bytes) -> dict:
     model reads the image directly. Pass the result to labs.normalize_report()."""
     if EXTRACT_PROVIDER == "claude":
         raw = _claude_run(image_bytes, _LAB_PROMPT)
+    elif EXTRACT_PROVIDER == "ollama":
+        raw = _ollama_chat(_LAB_PROMPT, image_bytes=image_bytes, schema=_lab_schema())
     else:
         raw = _medgemma_run(image_bytes, _LAB_PROMPT, prefill=EXTRACT_PREFILL)
     return _parse_labs(raw)

@@ -67,3 +67,23 @@ def test_parse_labs_bad_json_returns_empty_dict():
 
 def test_demographic_keys_exist():
     assert ocr.DEMOGRAPHIC_KEYS == ["name", "mrn", "dob", "sex"]
+
+
+def test_ollama_note_path_preserves_pipeline_contract(monkeypatch, png_bytes):
+    monkeypatch.setattr(ocr, "TRANSCRIBE_PROVIDER", "ollama")
+    monkeypatch.setattr(ocr, "EXTRACT_PROVIDER", "ollama")
+
+    def fake_chat(prompt, image_bytes=None, schema=None):
+        if image_bytes is not None:
+            return "CC: abdominal pain"
+        return json.dumps({
+            "patient": {"name": "", "mrn": "", "dob": "", "sex": ""},
+            **{key: ("abdominal pain" if key == "chief_complaint" else "")
+               for key in ocr._FIELD_KEYS},
+        })
+
+    monkeypatch.setattr(ocr, "_ollama_chat", fake_chat)
+    out = ocr.extract(png_bytes)
+    assert out["text"] == "CC: abdominal pain"
+    assert out["fields"]["chief_complaint"] == "abdominal pain"
+    assert out["demographics"]["name"] == ""

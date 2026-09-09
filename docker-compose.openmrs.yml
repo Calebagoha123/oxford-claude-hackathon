@@ -1,0 +1,112 @@
+services:
+  depaperfy:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: unless-stopped
+    depends_on:
+      openmrs-bootstrap:
+        condition: service_completed_successfully
+    environment:
+      WARMUP: ${WARMUP:-0}
+      EHR_MODE: openmrs
+      OCR_PROVIDER: ${DEPAPERFY_OCR_PROVIDER:-ollama}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3-vl:4b-instruct}
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      OPENMRS_BASE_URL: http://gateway/openmrs
+      OPENMRS_PUBLIC_URL: ${OPENMRS_PUBLIC_URL:-http://localhost:8080/openmrs}
+      OPENMRS_USERNAME: ${OPENMRS_USERNAME:-admin}
+      OPENMRS_PASSWORD: ${OPENMRS_PASSWORD:-Admin123}
+    ports:
+      - "${DEPAPERFY_PORT:-8000}:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  openmrs-bootstrap:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    restart: "no"
+    depends_on:
+      backend:
+        condition: service_healthy
+    command: ["python", "-m", "integrations.openmrs.bootstrap"]
+    environment:
+      OPENMRS_BASE_URL: http://backend:8080/openmrs
+      OPENMRS_USERNAME: ${OPENMRS_USERNAME:-admin}
+      OPENMRS_PASSWORD: ${OPENMRS_PASSWORD:-Admin123}
+      OPENMRS_BOOTSTRAP_TIMEOUT: 300
+
+  gateway:
+    image: openmrs/openmrs-reference-application-3-gateway:${OPENMRS_TAG:-demo}
+    restart: unless-stopped
+    depends_on:
+      frontend:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    ports:
+      - "${OPENMRS_PORT:-8080}:80"
+
+  frontend:
+    image: openmrs/openmrs-reference-application-3-frontend:${OPENMRS_TAG:-demo}
+    restart: unless-stopped
+    environment:
+      SPA_PATH: /openmrs/spa
+      API_URL: /openmrs
+      SPA_CONFIG_URLS: /openmrs/spa/config-core_demo.json
+      SPA_DEFAULT_LOCALE: en
+    depends_on:
+      backend:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost/"]
+      timeout: 5s
+      interval: 10s
+      retries: 20
+
+  backend:
+    image: openmrs/openmrs-reference-application-3-backend:${OPENMRS_TAG:-demo}
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      OMRS_CONFIG_MODULE_WEB_ADMIN: "true"
+      OMRS_CONFIG_AUTO_UPDATE_DATABASE: "true"
+      OMRS_CONFIG_CREATE_TABLES: "true"
+      OMRS_CONFIG_CONNECTION_SERVER: db
+      OMRS_CONFIG_CONNECTION_DATABASE: openmrs
+      OMRS_CONFIG_CONNECTION_USERNAME: ${OPENMRS_DB_USER:-openmrs}
+      OMRS_CONFIG_CONNECTION_PASSWORD: ${OPENMRS_DB_PASSWORD:-openmrs}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/openmrs"]
+      timeout: 5s
+      interval: 10s
+      retries: 60
+      start_period: 90s
+    volumes:
+      - openmrs-data:/openmrs/data
+
+  db:
+    image: mariadb:10.11.7
+    restart: unless-stopped
+    command: mysqld --character-set-server=utf8mb4 --collation-server=utf8mb4_general_ci
+    environment:
+      MYSQL_DATABASE: openmrs
+      MYSQL_USER: ${OPENMRS_DB_USER:-openmrs}
+      MYSQL_PASSWORD: ${OPENMRS_DB_PASSWORD:-openmrs}
+      MYSQL_ROOT_PASSWORD: ${OPENMRS_DB_ROOT_PASSWORD:-openmrs}
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - openmrs-db-data:/var/lib/mysql
+
+volumes:
+  openmrs-data:
+  openmrs-db-data:
